@@ -41,7 +41,35 @@ struct PackGroup
 {
     std::vector<Path> standard;
     std::vector<Path> texture;
+    std::vector<Path> mesh;
+    std::vector<Path> sound;
 };
+
+/// \brief Decide which physical archive a file belongs in, reusing the tes4_archive_type
+/// classification that already exists per-extension in Settings (standard_files / texture_files /
+/// incompressible_files). Only splits into a dedicated archive if the corresponding
+/// has_*_version flag is enabled; otherwise everything not routed to Textures falls back to Standard.
+[[nodiscard]] auto classify_archive_bucket(const Path &file_path,
+                                           const Settings &sets,
+                                           FileTypes filetype) noexcept -> ArchiveType
+{
+    // Textures keep using the existing FileTypes-based split (unchanged behavior).
+    if (sets.has_texture_version && filetype == FileTypes::Texture)
+        return ArchiveType::Textures;
+
+    const auto tes4_type = get_tes4_archive_type(file_path, sets);
+    if (!tes4_type)
+        return ArchiveType::Standard;
+
+    if (sets.has_mesh_version && *tes4_type == TES4ArchiveType::meshes)
+        return ArchiveType::Meshes;
+
+    if (sets.has_sound_version
+        && (*tes4_type == TES4ArchiveType::sounds || *tes4_type == TES4ArchiveType::voices))
+        return ArchiveType::Sounds;
+
+    return ArchiveType::Standard;
+}
 
 /// \brief List all files in the directory which can be packed, sorted by size (largest first)
 [[nodiscard]] auto list_packable_files(const Path &dir,
@@ -64,19 +92,21 @@ struct PackGroup
         return fs::file_size(lhs) > fs::file_size(rhs);
     });
 
-    // if we have separate texture archives, partition textures and standard files
-    if (sets.has_texture_version)
+    // distribute into buckets, preserving the largest-first order within each one
+    PackGroup groups;
+    for (auto &file : packable_files)
     {
-        // put textures at the end of the list
-        auto [textures_start, _] = std::ranges::stable_partition(packable_files, [&](const auto &file) {
-            return get_filetype(file, dir, sets) != FileTypes::Texture;
-        });
-
-        return {.standard = std::vector(packable_files.begin(), textures_start),
-                .texture  = std::vector(textures_start, packable_files.end())};
+        const auto filetype = get_filetype(file, dir, sets);
+        switch (classify_archive_bucket(file, sets, filetype))
+        {
+            case ArchiveType::Textures: groups.texture.push_back(std::move(file)); break;
+            case ArchiveType::Meshes: groups.mesh.push_back(std::move(file)); break;
+            case ArchiveType::Sounds: groups.sound.push_back(std::move(file)); break;
+            case ArchiveType::Standard: groups.standard.push_back(std::move(file)); break;
+        }
     }
 
-    return {.standard = BTU_MOV(packable_files), .texture = {}};
+    return groups;
 }
 
 [[nodiscard]] auto prepare_file(const Path &file_path,
@@ -160,19 +190,31 @@ struct PackGroup
 
 auto pack(const PackSettings settings) noexcept -> flux::generator<Archive &&>
 {
-    auto [standard, texture] = list_packable_files(settings.input_dir,
-                                                   settings.game_settings,
-                                                   get_allow_file_pred(settings));
+    auto groups = list_packable_files(settings.input_dir,
+                                      settings.game_settings,
+                                      get_allow_file_pred(settings));
 
-    if (!standard.empty())
+    if (!groups.standard.empty())
     {
-        FLUX_FOR(auto &&a, do_pack(BTU_MOV(standard), settings, ArchiveType::Standard))
+        FLUX_FOR(auto &&a, do_pack(BTU_MOV(groups.standard), settings, ArchiveType::Standard))
         { co_yield BTU_MOV(a); }
     }
 
-    if (!texture.empty())
+    if (!groups.texture.empty())
     {
-        FLUX_FOR(auto &&a, do_pack(BTU_MOV(texture), settings, ArchiveType::Textures))
+        FLUX_FOR(auto &&a, do_pack(BTU_MOV(groups.texture), settings, ArchiveType::Textures))
+        { co_yield BTU_MOV(a); }
+    }
+
+    if (!groups.mesh.empty())
+    {
+        FLUX_FOR(auto &&a, do_pack(BTU_MOV(groups.mesh), settings, ArchiveType::Meshes))
+        { co_yield BTU_MOV(a); }
+    }
+
+    if (!groups.sound.empty())
+    {
+        FLUX_FOR(auto &&a, do_pack(BTU_MOV(groups.sound), settings, ArchiveType::Sounds))
         { co_yield BTU_MOV(a); }
     }
 }

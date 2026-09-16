@@ -63,6 +63,20 @@ auto generate_mipmaps(CrunchTexture &&file) -> ResultCrunch
     return std::move(file);
 }
 
+auto crunch_supports_format(const DXGI_FORMAT format) noexcept -> bool
+{
+    // Keep in sync with the switch in convert() below - this mirrors exactly what crnlib can pack into.
+    switch (format)
+    {
+        case DXGI_FORMAT_BC1_UNORM:
+        case DXGI_FORMAT_BC3_UNORM:
+        case DXGI_FORMAT_B8G8R8X8_UNORM:
+        case DXGI_FORMAT_B8G8R8A8_UNORM:
+        case DXGI_FORMAT_R8G8B8A8_UNORM: return true;
+        default: return false; // notably: no BC7, crnlib has no encoder for it
+    }
+}
+
 auto convert(CrunchTexture &&file, const DXGI_FORMAT format) -> ResultCrunch
 {
     pixel_format crunch_format{};

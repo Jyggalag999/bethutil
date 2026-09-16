@@ -38,7 +38,8 @@ const auto k_suffix_separator = std::u8string(u8" - ");
 
 [[nodiscard]] auto archive_suffixes(const Settings &sets) -> std::vector<std::u8string>
 {
-    const auto raw_suffixes = std::to_array({sets.suffix, sets.texture_suffix});
+    const auto raw_suffixes = std::to_array(
+        {sets.suffix, sets.texture_suffix, sets.mesh_suffix, sets.sound_suffix});
     return flux::ref(raw_suffixes)
         .filter_map([](const auto &suffix) {
             return suffix.has_value() ? std::optional{k_suffix_separator + suffix.value()} : std::nullopt;
@@ -48,7 +49,18 @@ const auto k_suffix_separator = std::u8string(u8" - ");
 
 [[nodiscard]] auto archive_suffix_with_sep(const Settings &sets, ArchiveType type) -> std::u8string
 {
-    auto suffix = (type == ArchiveType::Textures ? sets.texture_suffix : sets.suffix).value_or(u8"");
+    const auto raw = [&]() -> std::optional<std::u8string> {
+        switch (type)
+        {
+            case ArchiveType::Textures: return sets.texture_suffix;
+            case ArchiveType::Meshes: return sets.mesh_suffix;
+            case ArchiveType::Sounds: return sets.sound_suffix;
+            case ArchiveType::Standard: return sets.suffix;
+        }
+        return sets.suffix;
+    }();
+
+    auto suffix = raw.value_or(u8"");
     if (!suffix.empty())
         suffix = k_suffix_separator + suffix;
 
@@ -138,6 +150,31 @@ auto find_archive_name_using_plugins(std::span<const Path> plugins, const Settin
 auto find_archive_name(const Path &directory, const Settings &sets, ArchiveType type) noexcept
     -> std::optional<Path>
 {
+    if (sets.forced_name.has_value())
+    {
+        const auto suffix = archive_suffix_with_sep(sets, type);
+        const auto &base  = *sets.forced_name;
+
+        // Try the plain name first (e.g. "Modx.bsa"). If a pack session yields more than one
+        // archive of this type (because the source files exceeded max_size and were split), that
+        // name is already taken by the previous chunk, so fall back to a counter suffix
+        // ("Modx1.bsa", "Modx2.bsa", ...) until an unused name is found. Without this, every extra
+        // chunk would resolve to the same path and silently overwrite the one before it.
+        if (const auto plain = directory / (base + suffix + sets.extension); !exists(plain))
+            return plain;
+
+        constexpr auto max_attempts = std::numeric_limits<uint8_t>::max();
+        for (uint8_t i = 1; i < max_attempts; ++i)
+        {
+            const auto counter = common::as_utf8_string(std::to_string(i));
+            auto file           = directory / (base + counter + suffix + sets.extension);
+            if (!exists(file))
+                return file;
+        }
+
+        return std::nullopt;
+    }
+
     if (!is_directory(directory))
         return std::nullopt;
 
@@ -187,6 +224,25 @@ void make_dummy_plugins(std::span<const Path> archives, const Settings &sets)
     if (!sets.dummy_plugin.has_value())
         return;
 
+    if (sets.forced_name.has_value())
+    {
+        // One shared plugin covers every suffixed archive via the engine's own prefix matching,
+        // so we only ever want a single dummy plugin here, not one per archive type.
+        if (archives.empty())
+            return;
+
+        const auto plugin_path = archives.front().parent_path() / (*sets.forced_name + sets.dummy_extension);
+        if (!exists(plugin_path))
+        {
+            const auto res = common::write_file_new(plugin_path, *sets.dummy_plugin);
+            if (!res)
+            {
+                // TODO: what to do?
+            }
+        }
+        return;
+    }
+
     for (const Path &arch : archives)
     {
         const auto associated_plugins = plugins_loading_archive(arch, sets);
@@ -220,7 +276,7 @@ auto list_archive(const Path &dir, const Settings &sets) noexcept -> std::vector
         // When a single plugin can load multiple archives, it loads all archives such that their
         // name contains the name of the corresponding plugin as a prefix. Sorting the archive
         // names by length should ensure that only the required number of dummy plugins is created.
-        flux::sort(archives, [](const auto p1, const auto p2) { return p1.stem() < p2.stem(); });
+        flux::sort(archives, [](const auto p1, const auto p2) { return p1.stem() <=> p2.stem(); });
 
         return archives;
     }

@@ -42,6 +42,8 @@ enum class ArchiveType : std::uint8_t
 {
     Textures,
     Standard,
+    Meshes,
+    Sounds,
 };
 
 enum class ArchiveVersion : std::uint32_t
@@ -56,7 +58,10 @@ enum class ArchiveVersion : std::uint32_t
 };
 
 NLOHMANN_JSON_SERIALIZE_ENUM(ArchiveType,
-                             {{ArchiveType::Textures, "textures"}, {ArchiveType::Standard, "standard"}})
+                             {{ArchiveType::Textures, "textures"},
+                              {ArchiveType::Standard, "standard"},
+                              {ArchiveType::Meshes, "meshes"},
+                              {ArchiveType::Sounds, "sounds"}})
 
 NLOHMANN_JSON_SERIALIZE_ENUM(ArchiveVersion,
                              {

@@ -120,9 +120,18 @@ struct Settings
 
     ArchiveVersion version{};
     bool has_texture_version;
+    bool has_mesh_version{false};
+    bool has_sound_version{false};
 
     std::optional<std::u8string> suffix;
     std::optional<std::u8string> texture_suffix;
+    std::optional<std::u8string> mesh_suffix;
+    std::optional<std::u8string> sound_suffix;
+
+    // User-typed base name. When set, this replaces the plugin/directory-name auto-detection in
+    // find_archive_name() and make_dummy_plugins() entirely, and only ONE dummy plugin is created
+    // (named forced_name + dummy_extension), regardless of how many archive types get split out.
+    std::optional<std::u8string> forced_name;
 
     std::u8string extension;
 
@@ -143,8 +152,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
                                    max_size,
                                    version,
                                    has_texture_version,
+                                   has_mesh_version,
+                                   has_sound_version,
                                    suffix,
                                    texture_suffix,
+                                   mesh_suffix,
+                                   sound_suffix,
+                                   forced_name,
                                    extension,
                                    plugin_extensions,
                                    dummy_plugin,
@@ -155,6 +169,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
 [[nodiscard]] inline auto Settings::get(Game game) -> const Settings &
 {
     constexpr auto megabyte = 1024ULL * 1024ULL;
+    constexpr auto gigabyte = 1024ULL * megabyte;
 
     static const Settings tes4_default_sets = [=] {
         Settings sets;
@@ -276,6 +291,22 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
                 s.game         = Game::FNV;
                 s.version      = ArchiveVersion::tes5;
                 s.dummy_plugin = std::vector(std::begin(dummy::fnv), std::end(dummy::fnv));
+
+                // Raised from the tes4 default (2000 MiB): FNV BSAs can go right up to the
+                // format's ~4GiB ceiling, so cap comfortably under that instead of splitting
+                // twice as often as necessary. 3.95 GiB leaves margin below 4GiB for tools/
+                // readers that get flaky exactly at the 32-bit size-field boundary.
+                s.max_size = gigabyte * 395 / 100; // 3.95 GiB
+
+                // Split textures/meshes/sounds into their own archives instead of
+                // one combined BSA: "ModName - Textures.bsa" / " - Meshes.bsa" / " - Sounds.bsa".
+                s.has_texture_version = true;
+                s.texture_suffix      = u8"Textures";
+                s.has_mesh_version    = true;
+                s.mesh_suffix         = u8"Meshes";
+                s.has_sound_version   = true;
+                s.sound_suffix        = u8"Sounds";
+
                 return s;
             }();
             return sets_fnv;

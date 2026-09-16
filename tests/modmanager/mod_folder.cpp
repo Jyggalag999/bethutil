@@ -9,7 +9,6 @@
 #include "btu/common/filesystem.hpp"
 
 #include <binary_io/memory_stream.hpp>
-#include <btu/hkx/anim.hpp>
 
 class Iterator final : public btu::modmanager::ModFolderIterator
 {

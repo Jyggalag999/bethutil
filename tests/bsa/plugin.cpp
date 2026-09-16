@@ -73,6 +73,34 @@ TEST_CASE("find_archive_name", "[src]")
         INFO(result.value().string());
         CHECK(result->filename() == Path("a1 - Textures.bsa"));
     }
+
+    SECTION("forced_name uses the plain name for the first archive")
+    {
+        const auto dir = prepare_dir({});
+        sets.forced_name = u8"Modx";
+
+        auto result = find_archive_name(dir.path(), sets, ArchiveType::Standard);
+        CHECK(result.has_value());
+        CHECK(result->filename() == Path("Modx.bsa"));
+    }
+
+    SECTION("forced_name adds a counter for each subsequent split-off archive instead of colliding")
+    {
+        // Simulates packing content too large for a single BSA under the same forced archive name:
+        // each successive chunk must land on its own file, not overwrite the previous one.
+        const auto dir = prepare_dir(std::vector{u8"Modx.bsa"sv});
+        sets.forced_name = u8"Modx";
+
+        auto result = find_archive_name(dir.path(), sets, ArchiveType::Standard);
+        CHECK(result.has_value());
+        CHECK(result->filename() == Path("Modx1.bsa"));
+
+        // and again, once "Modx1.bsa" is also taken
+        create_file(dir.path() / u8"Modx1.bsa");
+        result = find_archive_name(dir.path(), sets, ArchiveType::Standard);
+        CHECK(result.has_value());
+        CHECK(result->filename() == Path("Modx2.bsa"));
+    }
 }
 
 TEST_CASE("remake dummy plugins")

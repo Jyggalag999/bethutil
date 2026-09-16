@@ -26,6 +26,14 @@ struct Settings
     Game game;
 
     bool compress;
+    bool force_crunch = false; // Use crnlib's DXT encoder (via CrunchTexture path) instead of DirectXTex
+
+    // When true, restricts `compress` to textures that aren't already block-compressed: an
+    // already-compressed source (DirectXTex IsCompressed(), or CrunchTexture::is_packed()) is left
+    // on its current format entirely instead of being normalized towards output_format.compressed
+    // /compressed_without_alpha. See best_output_format() in optimize.cpp.
+    bool compress_uncompressed_only = false;
+
     std::variant<std::monostate, util::ResizeRatio, Dimension> resize;
     bool mipmaps;
 
@@ -40,6 +48,8 @@ struct Settings
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
                                    game,
                                    compress,
+                                   force_crunch,
+                                   compress_uncompressed_only,
                                    resize,
                                    mipmaps,
                                    use_format_whitelist,

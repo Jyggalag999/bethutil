@@ -13,6 +13,8 @@
 #include <btu/common/metaprogramming.hpp>
 #include <btu/tex/dxtex.hpp>
 
+#include <crunch/crn_image_utils.h>
+
 namespace btu::tex {
 auto optimize(Texture &&file, OptimizationSteps sets, CompressionDevice &dev) noexcept -> Result
 {
@@ -108,6 +110,31 @@ auto optimize(CrunchTexture &&file,
     return !has_alpha || alpha_mode == TEX_ALPHA_MODE_OPAQUE || tex.IsAlphaAllOpaque();
 }
 
+/// crnlib's own mipmapped_texture::has_alpha() is a format-level check only ("does this pixel
+/// format carry an alpha channel"), not a pixel-level one - unlike DirectXTex's IsAlphaAllOpaque()
+/// above, it says nothing about whether that channel's values are actually all opaque. Left
+/// unchecked, that meant diffuse textures with a fully-opaque alpha channel always got routed to
+/// an alpha-preserving compressed format (e.g. BC3) via the crunch path even when DirectXTex would
+/// correctly pick the smaller alpha-less one (e.g. BC1) for the exact same texture. This mirrors
+/// has_opaque_alpha(ScratchImage) above using crnlib's own real per-pixel scan
+/// (image_utils::has_alpha, which is true iff some pixel's alpha < 255) as the equivalent of
+/// IsAlphaAllOpaque().
+[[nodiscard]] static auto has_opaque_alpha(const CrunchTexture &file) noexcept -> bool
+{
+    const auto &tex = file.get();
+
+    // Fast path: format itself carries no alpha channel at all, nothing to scan.
+    if (!tex.has_alpha())
+        return true;
+
+    crnlib::image_u8 img;
+    const auto *unpacked = tex.get_level_image(0, 0, img); // auto-decompresses if currently packed
+    if (unpacked == nullptr)
+        return false; // failed to unpack: be conservative, assume alpha might matter
+
+    return !crnlib::image_utils::has_alpha(*unpacked);
+}
+
 template<class Tex>
 [[nodiscard]] static auto can_be_compressed(const Tex &file) noexcept -> bool
 {
@@ -167,6 +194,11 @@ template<class Tex>
     const auto &tex  = file.get();
     const auto &info = tex.GetMetadata();
 
+    // "Only compress what's uncompressed": leave an already block-compressed source exactly as it
+    // is instead of normalizing it towards output_format.compressed/compressed_without_alpha.
+    if (sets.compress_uncompressed_only && DirectX::IsCompressed(info.format))
+        return info.format;
+
     return guess_best_format(info.format,
                              sets.output_format,
                              GuessBestFormatArgs{.opaque_alpha     = has_opaque_alpha(tex),
@@ -178,11 +210,24 @@ template<class Tex>
                                              const Settings &sets,
                                              bool force_alpha) noexcept -> DXGI_FORMAT
 {
-    const auto &tex = file.get();
+    // Same "only compress what's uncompressed" carve-out as the DirectXTex path above, using
+    // crnlib's own is_packed() (true iff the texture is currently DXT-encoded) as the equivalent
+    // of DirectX::IsCompressed() - but only when crnlib can actually re-encode into that exact
+    // source format. crnlib's encoder repertoire is far smaller than its decoder one (notably no
+    // BC7), so for a source format it has no encoder for, "leave it as-is" isn't achievable once
+    // a resize/mipmap regen forces a decompress+recompress cycle (see must_decompress in
+    // optimize(CrunchTexture&&, ...) below) - that used to just fail the whole file with BadInput.
+    // Recompress into this profile's configured compressed format instead: guess_best_format
+    // treats "already compressed" as reason enough to pick formats.compressed/
+    // compressed_without_alpha regardless of sets.compress, and can_use_crunch (main_process.cpp)
+    // already guarantees those two are crunch-encodable whenever force_crunch is on.
+    if (sets.compress_uncompressed_only && file.get().is_packed()
+        && crunch_supports_format(file.get_format_as_dxgi()))
+        return file.get_format_as_dxgi();
 
     return guess_best_format(file.get_format_as_dxgi(),
                              sets.output_format,
-                             GuessBestFormatArgs{.opaque_alpha     = !tex.has_alpha(),
+                             GuessBestFormatArgs{.opaque_alpha     = has_opaque_alpha(file),
                                                  .allow_compressed = sets.compress
                                                                      && can_be_compressed<CrunchTexture>(file),
                                                  .force_alpha = force_alpha});
@@ -236,8 +281,12 @@ auto compute_optimization_steps(const CrunchTexture &file, const Settings &sets)
     if (target_dim.has_value() && dim != target_dim.value())
         res.resize = target_dim.value();
 
-    // Mipmaps.
-    if (sets.mipmaps
+    // Mipmaps. Same "already has the right chain, don't touch it" guard as the DirectXTex path
+    // above (opt_mip) - without it, the global mipmaps toggle alone forced every already-optimal
+    // crunch-path texture through a needless (and lossy, since it also recompresses) decompress/
+    // regenerate/recompress round-trip for a mip chain that was already correct.
+    const bool opt_mip = optimal_mip_count(file.get_dimension()) == tex.get_num_levels();
+    if ((sets.mipmaps && !opt_mip)
         || (tex.get_num_levels() > 1 && res.resize)) // resize removes mips if there are any, regenerate them
         res.mipmaps = true;
 

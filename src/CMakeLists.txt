@@ -19,8 +19,11 @@ set(HEADER_FILES
         "${INCLUDE_DIR}/btu/bsa/plugin.hpp"
         "${INCLUDE_DIR}/btu/esp/error_code.hpp"
         "${INCLUDE_DIR}/btu/esp/functions.hpp"
-        "${INCLUDE_DIR}/btu/hkx/anim.hpp"
-        "${INCLUDE_DIR}/btu/hkx/error_code.hpp"
+        "${INCLUDE_DIR}/btu/kf/compress.hpp"
+        "${INCLUDE_DIR}/btu/kf/error_code.hpp"
+        "${INCLUDE_DIR}/btu/kf/detail/bspline.hpp"
+        "${INCLUDE_DIR}/btu/kf/detail/byteio.hpp"
+        "${INCLUDE_DIR}/btu/kf/detail/niftypes.hpp"
         "${INCLUDE_DIR}/btu/modmanager/mod_folder.hpp"
         "${INCLUDE_DIR}/btu/modmanager/mod_manager.hpp"
         "${INCLUDE_DIR}/btu/nif/detail/common.hpp"
@@ -50,7 +53,7 @@ set(SOURCE_FILES
         "${SOURCE_DIR}/bsa/plugin.cpp"
         "${SOURCE_DIR}/bsa/unpack.cpp"
         "${SOURCE_DIR}/esp/functions.cpp"
-        "${SOURCE_DIR}/hkx/anim.cpp"
+        "${SOURCE_DIR}/kf/compress.cpp"
         "${SOURCE_DIR}/modmanager/mod_folder.cpp"
         "${SOURCE_DIR}/modmanager/mod_manager.cpp"
         "${SOURCE_DIR}/nif/functions.cpp"
@@ -107,9 +110,6 @@ target_link_libraries("${PROJECT_NAME}" PRIVATE mpsc::mpsc_channel)
 
 find_package(nlohmann_json CONFIG REQUIRED)
 target_link_libraries("${PROJECT_NAME}" PRIVATE nlohmann_json::nlohmann_json)
-
-find_package(reproc++ CONFIG REQUIRED)
-target_link_libraries("${PROJECT_NAME}" PRIVATE reproc++)
 
 find_package(crunch2 CONFIG REQUIRED)
 target_link_libraries("${PROJECT_NAME}" PRIVATE crunch::crunch2)

@@ -17,7 +17,6 @@ set(SOURCE_FILES
     "${SOURCE_DIR}/bsa/plugin.cpp"
     "${SOURCE_DIR}/bsa/unpack.cpp"
     "${SOURCE_DIR}/esp/functions.cpp"
-    "${SOURCE_DIR}/hkx/anim.cpp"
     "${SOURCE_DIR}/modmanager/mod_folder.cpp"
     "${SOURCE_DIR}/modmanager/mod_manager.cpp"
     "${SOURCE_DIR}/nif/functions.cpp"
@@ -63,7 +62,6 @@ endmacro()
 acquire_test("bsa_clean_dummy_plugins")
 acquire_test("bsa_unpack")
 acquire_test("bsa_load_save")
-acquire_test("convert-hkx")
 acquire_test("decompress")
 acquire_test("esp")
 acquire_test("make_transparent_alpha")

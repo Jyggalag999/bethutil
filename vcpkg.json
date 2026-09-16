@@ -17,7 +17,6 @@
     "mpsc-channel",
     "nifly",
     "nlohmann-json",
-    "reproc",
     "utf8h",
     "rsm-bsa",
     "tl-expected",
