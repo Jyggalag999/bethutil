@@ -1,3 +1,16 @@
+// Copyright (C) 2026 Jyggalag
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License, version 2 only,
+// as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//
+// SPDX-License-Identifier: GPL-2.0-only
+// See LICENSE.txt for the full license text.
+//
 // niftypes.hpp - NIF container parsing scoped to version 20.2.0.7 (Bethesda
 // Fallout 3 / Fallout New Vegas / late-patch Oblivion), which is the only
 // version this compressor supports. Field layouts are taken directly from
@@ -428,7 +441,7 @@ inline Header readHeader(ByteReader& r) {
         throw std::runtime_error(
             "Unsupported NIF version 0x" + std::to_string(h.version) +
             " -- this tool only supports version 20.2.0.7 (0x14020007), i.e. "
-            "Fallout 3 / Fallout New Vegas / late-patch Oblivion .kf/.nif files.");
+            "Fallout 3 / Fallout New Vegas / late-patch Oblivion .kf files.");
     }
 
     h.hasBSHeader = isBethesdaStreamHeaderPresent(h.version, h.userVersion);
@@ -442,7 +455,7 @@ inline Header readHeader(ByteReader& r) {
     } else {
         throw std::runtime_error(
             "This NIF has no BSStreamHeader (not a Bethesda export) -- this "
-            "tool targets Bethesda Fallout 3/NV .kf/.nif files specifically.");
+            "tool targets Bethesda Fallout 3/NV .kf files specifically.");
     }
 
     h.numBlockTypes = r.u16();

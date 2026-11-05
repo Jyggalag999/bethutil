@@ -1,3 +1,16 @@
+// Copyright (C) 2026 Jyggalag
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License, version 2 only,
+// as published by the Free Software Foundation.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+//
+// SPDX-License-Identifier: GPL-2.0-only
+// See LICENSE.txt for the full license text.
+//
 // bspline.hpp - fit an open, uniform, clamped cubic (degree 3) B-spline to a
 // sampled scalar/vector curve via least squares, matching the curve family
 // used by NiBSplineData / NiBSplineBasisData in the Gamebryo/NetImmerse engine.
@@ -62,36 +75,56 @@ inline void basisRow(const std::vector<double>& knots, int M, int p, double t,
     }
 }
 
-// Solve (A^T A) x = A^T b for several right-hand-side columns at once via
-// LU decomposition with partial pivoting on the (small, dense) MxM normal
-// matrix. `rhs` is stored column-major: rhs[col][row].
+// Solve (A^T A) x = A^T b for several right-hand-side columns at once.
+// `rhs` is stored column-major: rhs[col][row].
+//
+// The normal matrix is banded, so it is stored and factored as a band
+// instead of a dense MxM matrix. Why it is banded: a degree-p B-spline
+// basis row has at most p+1 consecutive nonzeros, so (A^T A)[i][j] == 0
+// whenever |i-j| > p; the second-difference roughness penalty below only
+// touches |i-j| <= 2. Half-bandwidth is therefore max(p, 2) == 3 for
+// cubics. It is also symmetric positive definite (A^T A is PSD, and the
+// 1e-9 diagonal plus the PSD penalty D^T D push it strictly positive), so
+// a banded Cholesky factorization needs no pivoting and costs O(M * W^2)
+// instead of the O(M^3) a dense Gauss-Jordan solve costs. That matters
+// for --tolerance (adaptive M search) and large-M fits, where the solve
+// used to dominate the runtime.
+//
+// Storage: band[i][k] holds ATA[i][i+k] (upper triangle, k = 0..W).
 inline std::vector<std::vector<double>> solveNormalEquations(
     const std::vector<std::vector<double>>& A,             // S x M
     const std::vector<std::vector<double>>& rhsColumns) {  // C columns, each length S
     size_t S = A.size();
     size_t M = S ? A[0].size() : 0;
     size_t C = rhsColumns.size();
+    const size_t W = size_t(std::max(kDegree, 2));
 
-    // Build normal matrix ATA (M x M) and ATb (M x C).
-    std::vector<std::vector<double>> ATA(M, std::vector<double>(M, 0.0));
+    // Build banded normal matrix ATA (M x (W+1)) and ATb (M x C). Each
+    // basis row's nonzeros all sit inside [first, first+W], so only that
+    // window is visited instead of the full row.
+    std::vector<std::vector<double>> band(M, std::vector<double>(W + 1, 0.0));
     std::vector<std::vector<double>> ATb(M, std::vector<double>(C, 0.0));
     for (size_t s = 0; s < S; ++s) {
-        for (size_t i = 0; i < M; ++i) {
-            double ai = A[s][i];
+        const auto& row = A[s];
+        size_t first = 0;
+        while (first < M && row[first] == 0.0) ++first;
+        size_t last = std::min(M, first + W + 1);
+        for (size_t i = first; i < last; ++i) {
+            double ai = row[i];
             if (ai == 0.0) continue;
-            for (size_t j = 0; j < M; ++j) ATA[i][j] += ai * A[s][j];
+            for (size_t j = i; j < last; ++j) band[i][j - i] += ai * row[j];
             for (size_t c = 0; c < C; ++c) ATb[i][c] += ai * rhsColumns[c][s];
         }
     }
     // Tiny Tikhonov regularization for numerical stability on
     // under-determined / degenerate systems (e.g. constant channels).
-    for (size_t i = 0; i < M; ++i) ATA[i][i] += 1e-9;
+    for (size_t i = 0; i < M; ++i) band[i][0] += 1e-9;
 
     // Roughness penalty on the control polygon's discrete second
     // derivative (D^T D, D = second-difference operator). Required, not
     // cosmetic: the real engine's NiBSplineBasis::Compute hard-codes a
-    // *uniform* clamped knot vector at decode time (confirmed in
-    // recon/ida_dump.txt), so the encoder cannot switch to chord-length
+    // *uniform* clamped knot vector at decode time, so the encoder
+    // cannot switch to chord-length
     // or otherwise non-uniform knot placement to fix this without
     // breaking playback -- this has to be solved on the solve side.
     //
@@ -128,51 +161,57 @@ inline std::vector<std::vector<double>> solveNormalEquations(
     // differently per channel type the way a fixed constant would.
     if (M >= 3) {
         double diagSum = 0.0;
-        for (size_t i = 0; i < M; ++i) diagSum += ATA[i][i];
+        for (size_t i = 0; i < M; ++i) diagSum += band[i][0];
         double lambda = (diagSum / double(M)) * 1e-3;
         if (lambda > 0.0) {
+            // Upper-triangle half of each D^T D 3x3 block; the band is
+            // symmetric so the lower entries are implied.
             for (size_t i = 0; i + 2 < M; ++i) {
-                ATA[i][i]     += lambda;
-                ATA[i][i+1]   -= 2.0 * lambda;
-                ATA[i][i+2]   += lambda;
-                ATA[i+1][i]   -= 2.0 * lambda;
-                ATA[i+1][i+1] += 4.0 * lambda;
-                ATA[i+1][i+2] -= 2.0 * lambda;
-                ATA[i+2][i]   += lambda;
-                ATA[i+2][i+1] -= 2.0 * lambda;
-                ATA[i+2][i+2] += lambda;
+                band[i][0]   += lambda;
+                band[i][1]   -= 2.0 * lambda;
+                band[i][2]   += lambda;
+                band[i+1][0] += 4.0 * lambda;
+                band[i+1][1] -= 2.0 * lambda;
+                band[i+2][0] += lambda;
             }
         }
     }
 
-    // Gaussian elimination with partial pivoting, augmented with C RHS columns.
-    std::vector<std::vector<double>> aug(M, std::vector<double>(M + C));
+    // Banded Cholesky: L[i][k] = L(i, i-k), the lower factor of
+    // ATA = L L^T, k = 0..W. ATA(i, j) for j < i is read from the upper
+    // storage as band[j][i-j].
+    std::vector<std::vector<double>> L(M, std::vector<double>(W + 1, 0.0));
     for (size_t i = 0; i < M; ++i) {
-        for (size_t j = 0; j < M; ++j) aug[i][j] = ATA[i][j];
-        for (size_t c = 0; c < C; ++c) aug[i][M + c] = ATb[i][c];
-    }
-    for (size_t col = 0; col < M; ++col) {
-        size_t piv = col;
-        double best = std::fabs(aug[col][col]);
-        for (size_t r = col + 1; r < M; ++r) {
-            double v = std::fabs(aug[r][col]);
-            if (v > best) { best = v; piv = r; }
+        size_t jStart = i > W ? i - W : 0;
+        for (size_t j = jStart; j < i; ++j) {
+            double sum = band[j][i - j];
+            for (size_t m = jStart; m < j; ++m) sum -= L[i][i - m] * L[j][j - m];
+            L[i][i - j] = sum / L[j][0];
         }
-        if (piv != col) std::swap(aug[piv], aug[col]);
-        double d = aug[col][col];
-        if (std::fabs(d) < 1e-15) d = (d < 0 ? -1e-15 : 1e-15);
-        for (size_t r = 0; r < M; ++r) {
-            if (r == col) continue;
-            double factor = aug[r][col] / d;
-            if (factor == 0.0) continue;
-            for (size_t c2 = col; c2 < M + C; ++c2) aug[r][c2] -= factor * aug[col][c2];
-        }
+        double d = band[i][0];
+        for (size_t m = jStart; m < i; ++m) d -= L[i][i - m] * L[i][i - m];
+        // SPD in exact arithmetic; guard anyway so a pathological rounding
+        // case degrades like a tiny-pivot clamp instead of producing NaN.
+        if (!(d > 1e-15)) d = 1e-15;
+        L[i][0] = std::sqrt(d);
     }
+
+    // Forward (L y = b) then back (L^T x = y) substitution per RHS column.
     std::vector<std::vector<double>> result(C, std::vector<double>(M));
-    for (size_t i = 0; i < M; ++i) {
-        double d = aug[i][i];
-        if (std::fabs(d) < 1e-15) d = (d < 0 ? -1e-15 : 1e-15);
-        for (size_t c = 0; c < C; ++c) result[c][i] = aug[i][M + c] / d;
+    for (size_t c = 0; c < C; ++c) {
+        auto& x = result[c];
+        for (size_t i = 0; i < M; ++i) {
+            double sum = ATb[i][c];
+            size_t jStart = i > W ? i - W : 0;
+            for (size_t j = jStart; j < i; ++j) sum -= L[i][i - j] * x[j];
+            x[i] = sum / L[i][0];
+        }
+        for (size_t i = M; i-- > 0;) {
+            double sum = x[i];
+            size_t jEnd = std::min(M, i + W + 1);
+            for (size_t j = i + 1; j < jEnd; ++j) sum -= L[j][j - i] * x[j];
+            x[i] = sum / L[i][0];
+        }
     }
     return result;
 }
@@ -202,11 +241,6 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
     // produce the SAME M as its bone's denser channels, or the control-point
     // pool ends up holding fewer elements for that channel's handle than
     // the shared basis block declares -- an out-of-bounds read at playback.
-    // Confirmed as a real, widespread bug this way: validating a full
-    // 14,313-file real batch found 1,784 files with exactly this handle/M
-    // mismatch on scale channels specifically (scale is almost always the
-    // sparsest channel on a bone), traced back to this clamp silently
-    // returning fewer control points than the caller asked for.
 
     auto knots = clampedUniformKnots(M, p);
 
@@ -217,27 +251,23 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
 
     // Fit DEVIATIONS from each component's own mean, not the raw values.
     // Why: when M is large relative to S (a sparse channel -- e.g. a
-    // 1-key scale track -- sharing a bone's basis block with a much
-    // denser channel, forced up to that bone's shared M), most control
-    // points have no real constraint from any sample and are set purely
-    // by the Tikhonov regularization term (ATA[i][i] += 1e-9 below),
-    // which pulls an unconstrained control point toward *zero*. For a
-    // scale channel (nominally ~1.0) that means most of the curve
-    // decodes near 0 instead of near 1 -- i.e. the character's scale
-    // collapses to nothing for most of the clip: a real, confirmed
-    // "character is the size of a smurf" bug, found by fit-quality
-    // testing on a real 1-key scale track forced to M=356 by its bone's
-    // dense translation/rotation channels. The same failure mode exists
-    // for rotation (an unconstrained quaternion component droops to 0,
-    // which is a degenerate, non-unit quaternion, not identity) and for
-    // translation (droops to world origin, not the bone's own position).
+    // 1-key scale track -- sharing a bone's basis block with a much denser
+    // channel, forced up to that bone's shared M), most control points have
+    // no real constraint from any sample and are set purely by the Tikhonov
+    // regularization term (ATA[i][i] += 1e-9 below), which pulls an
+    // unconstrained control point toward *zero*. For a scale channel
+    // (nominally ~1.0) that means most of the curve decodes near 0 instead
+    // of near 1, i.e. the model's scale collapses to nothing for most of
+    // the clip. The same failure mode applies to rotation (droops to a
+    // degenerate, non-unit quaternion instead of identity) and translation
+    // (droops to world origin instead of the bone's own position).
     // Centering the fit on each component's mean makes the regularizer's
-    // implicit default "hold this channel's own typical value" instead
-    // of "hold zero" -- for the degenerate single-key case this is exact
-    // (mean == the one value, so the deviation target is all zeros and
-    // the minimum-norm solution is a flat curve at that value, everywhere,
-    // via the B-spline partition-of-unity property), and for any other
-    // sparse-relative-to-M channel it's a strictly better default than 0.
+    // implicit default "hold this channel's own typical value" instead of
+    // "hold zero" -- for the degenerate single-key case this is exact (mean
+    // == the one value, so the minimum-norm solution is a flat curve at
+    // that value everywhere, via the B-spline partition-of-unity property),
+    // and for any other sparse-relative-to-M channel it's strictly better
+    // than 0.
     std::vector<double> mean(C, 0.0);
     for (size_t c = 0; c < C; ++c) {
         for (size_t s = 0; s < S; ++s) mean[c] += values[s][c];
@@ -270,19 +300,16 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
 }
 
 // Picks a small M in [minM, maxM] with reconstruction error <= tol.
-// Each individual fit is O(M^3) (dense Gaussian elimination on the MxM
-// normal matrix), so a naive linear scan of every M from minM..maxM is
-// O(maxM) *fits*, and the cost of those fits themselves grows cubically
-// as M grows -- for an animation with an unusually large number of
-// keyframes (large maxM), this combination can make one single channel's
-// search take a very long time. Exponential search for a working upper
+// Each individual fit is O(S*M) (building the dense S x M basis matrix and
+// the error check; the banded solve itself is linear in M), so a naive
+// linear scan of every M from minM..maxM is O(maxM) *fits*, each growing
+// with M -- for an animation with an unusually large number of keyframes
+// (large maxM), this combination can make one single channel's search
+// take a long time. Exponential search for a working upper
 // bound, then binary search within it, cuts this to O(log maxM) fits
-// instead -- found the hard way when one outlier file in a 14,000+ file
-// batch made one worker thread hang long enough that the whole run
-// looked stuck (the other threads had already finished everything else
-// and were just waiting at the join). Callers should also externally cap
-// maxM (see Options::maxControlPoints in main.cpp) since even O(log maxM)
-// fits doesn't bound the cost of the single largest fit attempted.
+// instead. Callers should also externally cap maxM (see
+// Options::maxControlPoints in main.cpp) since even O(log maxM) fits
+// doesn't bound the cost of the single largest fit attempted.
 inline FitResult fitBSplineAdaptive(const std::vector<double>& ts,
                                      const std::vector<std::vector<double>>& values,
                                      double tolerance, int minM, int maxM) {

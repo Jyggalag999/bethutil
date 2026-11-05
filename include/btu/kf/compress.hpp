@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <span>
+#include <string>
 #include <vector>
 
 namespace btu::kf {
@@ -51,7 +52,20 @@ struct Settings
 
     // Pack control points as 16-bit fixed point (NiBSplineCompTransformInterpolator)
     // instead of raw floats.
-    bool compact16 = false;
+    // On by default: it is the only mode matching the real on-disk format.
+    bool compact16 = true;
+
+    // Floor under the ratio-driven control-point count, so short/snappy clips keep
+    // enough basis functions for sharp corners (see kfcompress --min-control-points).
+    // 0 = no floor.
+    int min_control_points = 48;
+
+    // Lossless pre-pass that removes redundant repeated keys before the (lossy) fit.
+    // The fit itself still reads the original keys, so held poses don't bulge.
+    bool dedupe = true;
+
+    // Only meaningful with dedupe; 0 = strictly lossless (see kfcompress --epsilon).
+    float dedupe_epsilon = 0.0f;
 
     // Convert every eligible bone even if doing so wouldn't actually shrink
     // that bone's data at the file's shared control-point count. Off by
@@ -67,14 +81,18 @@ struct Settings
     std::vector<std::u8string> blacklist_add;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
+// _WITH_DEFAULT: profiles saved before min_control_points/dedupe existed still load.
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Settings,
                                    ratio,
                                    use_tolerance,
                                    tolerance,
                                    control_points,
                                    max_control_points,
+                                   min_control_points,
                                    skip,
                                    compact16,
+                                   dedupe,
+                                   dedupe_epsilon,
                                    force_convert_all,
                                    no_blacklist,
                                    blacklist_add)
@@ -85,7 +103,12 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
 /// kfcompress's own "copy through unchanged" behavior - this always returns a
 /// valid file, never "nothing to do", so callers don't need a separate
 /// no-op case (compare btu::hkx::AnimExe::convert, which this replaces).
-[[nodiscard]] auto compress(std::span<const std::byte> input, const Settings &settings) noexcept
+///
+/// If `diagnostics` is non-null it receives the compressor's log and, on failure, the reason
+/// (a std::error_code can't carry text), so the caller can log it.
+[[nodiscard]] auto compress(std::span<const std::byte> input,
+                            const Settings &settings,
+                            std::string *diagnostics = nullptr) noexcept
     -> tl::expected<std::vector<std::byte>, Error>;
 
 } // namespace btu::kf

@@ -18,8 +18,8 @@ enum class KfErr : std::uint8_t
                        // (logged by the caller) for the specific reason.
     ConversionFailed,  // any other convertFile() failure (malformed/truncated block table,
                        // an internal fit-count invariant violation, etc.)
-    TempFileIo,        // couldn't write the input span or read the output back from the
-                       // temp file convertFile() itself still reads/writes by path.
+    TempFileIo,        // unused since the compressor stopped bridging through temp files; kept so
+                       // existing error-code values stay stable.
 };
 } // namespace btu::kf
 
