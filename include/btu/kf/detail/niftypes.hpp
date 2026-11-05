@@ -22,7 +22,6 @@
 #include <cstdint>
 #include <cstdio>
 #include <map>
-#include <optional>
 #include <set>
 #include <string>
 #include <vector>
@@ -72,8 +71,6 @@ enum class KeyType : uint32_t {
     CONST_KEY = 5,
 };
 
-struct TBC { float t = 0, b = 0, c = 0; };
-
 template <typename T>
 struct Key {
     float time = 0;
@@ -97,11 +94,32 @@ inline Quaternion readQuaternion(ByteReader& r) {
     Quaternion q; q.w = r.f32(); q.x = r.f32(); q.y = r.f32(); q.z = r.f32(); return q;
 }
 
+// Validates a KeyType read from the file and the key count that goes with it,
+// BEFORE any container is sized. Out-of-range types would otherwise be treated
+// as "no tangents" and only fail later on the block-size check; a bogus count
+// would make resize(n) commit gigabytes before the per-field bounds checks
+// fire. Shared by the dedupe reader so the rule is written once.
+// valueBytes is the serialized size of the key value (4 float, 12 Vector3,
+// 16 quaternion); QUADRATIC adds tangents (2 values, or 2 floats when the
+// value is a float -- two tangents of the value type either way), TBC adds
+// three floats. Quaternion keys (quadTangents=false) have no QUADRATIC
+// tangents in the file format. Valid files never trip it.
+inline KeyType checkKeys(ByteReader& r, uint32_t n, uint32_t rawType, size_t valueBytes, bool quadTangents = true) {
+    if (rawType < 1 || rawType > 5)
+        throw FormatError("Invalid KeyType " + std::to_string(rawType) + " in key data");
+    KeyType t = static_cast<KeyType>(rawType);
+    size_t perKey = 4 + valueBytes;
+    if (t == KeyType::QUADRATIC_KEY && quadTangents) perKey += 2 * valueBytes;
+    else if (t == KeyType::TBC_KEY) perKey += 12;
+    r.count(n, perKey);
+    return t;
+}
+
 inline KeyGroup<float> readFloatKeyGroup(ByteReader& r) {
     KeyGroup<float> g;
     uint32_t n = r.u32();
     if (n == 0) return g;
-    g.interpolation = static_cast<KeyType>(r.u32());
+    g.interpolation = checkKeys(r, n, r.u32(), 4);
     g.keys.resize(n);
     for (uint32_t i = 0; i < n; ++i) {
         Key<float> k;
@@ -118,7 +136,7 @@ inline KeyGroup<Vector3> readVector3KeyGroup(ByteReader& r) {
     KeyGroup<Vector3> g;
     uint32_t n = r.u32();
     if (n == 0) return g;
-    g.interpolation = static_cast<KeyType>(r.u32());
+    g.interpolation = checkKeys(r, n, r.u32(), 12);
     g.keys.resize(n);
     for (uint32_t i = 0; i < n; ++i) {
         Key<Vector3> k;
@@ -150,7 +168,10 @@ struct TransformData {
         TransformData d;
         d.numRotationKeys = r.u32();
         if (d.numRotationKeys != 0) {
-            d.rotationType = static_cast<KeyType>(r.u32());
+            uint32_t rawType = r.u32();
+            if (rawType != static_cast<uint32_t>(KeyType::XYZ_ROTATION_KEY))
+                d.rotationType = checkKeys(r, d.numRotationKeys, rawType, 16, false);
+            else d.rotationType = KeyType::XYZ_ROTATION_KEY;
             if (d.rotationType != KeyType::XYZ_ROTATION_KEY) {
                 d.quatKeys.resize(d.numRotationKeys);
                 for (uint32_t i = 0; i < d.numRotationKeys; ++i) {
@@ -171,7 +192,7 @@ struct TransformData {
 
         size_t consumed = r.pos - startPos;
         if (consumed != blockSizeForValidation) {
-            throw std::runtime_error(
+            throw FormatError(
                 "NiTransformData: parsed " + std::to_string(consumed) +
                 " bytes but block size says " + std::to_string(blockSizeForValidation) +
                 " -- this file's NiTransformData layout doesn't match what this tool "
@@ -205,7 +226,7 @@ struct TransformInterpolator {
         ti.dataRef = r.i32();
         size_t consumed = r.pos - startPos;
         if (consumed != blockSizeForValidation) {
-            throw std::runtime_error(
+            throw FormatError(
                 "NiTransformInterpolator: parsed " + std::to_string(consumed) +
                 " bytes but block size says " + std::to_string(blockSizeForValidation) +
                 " -- unsupported file variant, aborting.");
@@ -270,6 +291,7 @@ struct ControllerSequence {
         cs.nameIdx = r.i32();
         uint32_t numControlled = r.u32();
         cs.arrayGrowBy = r.u32();
+        r.count(numControlled, ControlledBlock::kSize);
         cs.blocks.resize(numControlled);
         for (uint32_t i = 0; i < numControlled; ++i) cs.blocks[i] = ControlledBlock::read(r);
 
@@ -288,13 +310,14 @@ struct ControllerSequence {
         } else if (bsVersion > 28) {
             cs.animNoteMode = AnimNoteMode::Array;
             uint16_t n = r.u16();
+            r.count(n, 4);
             cs.animNoteArrayRefs.resize(n);
             for (uint16_t i = 0; i < n; ++i) cs.animNoteArrayRefs[i] = r.i32();
         }
 
         size_t consumed = r.pos - startPos;
         if (consumed != blockSizeForValidation) {
-            throw std::runtime_error(
+            throw FormatError(
                 "NiControllerSequence: parsed " + std::to_string(consumed) +
                 " bytes but block size says " + std::to_string(blockSizeForValidation) +
                 " (BSVersion=" + std::to_string(bsVersion) + ") -- unsupported file "
@@ -424,12 +447,6 @@ inline bool isBethesdaStreamHeaderPresent(uint32_t version, uint32_t userVersion
     return userVersion >= 3;
 }
 
-struct ParsedFile {
-    Header header;
-    std::vector<size_t> blockOffsets; // start offset (within body) of each block
-    std::vector<uint8_t> body;        // everything after the header, verbatim
-};
-
 inline Header readHeader(ByteReader& r) {
     Header h;
     h.headerString = r.lineString();
@@ -443,43 +460,61 @@ inline Header readHeader(ByteReader& r) {
         // after the "0x" prefix, which reads like a bogus hex number.
         char hex[9];
         std::snprintf(hex, sizeof(hex), "%08X", h.version);
-        throw std::runtime_error(
+        throw FormatError(
             std::string("Unsupported NIF version 0x") + hex +
             " -- this tool only supports version 20.2.0.7 (0x14020007), i.e. "
             "Fallout 3 / Fallout New Vegas / late-patch Oblivion .kf files.");
     }
 
+    // Every field after this is parsed little-endian; a big-endian file
+    // (endianType 0) would be misread rather than rejected.
+    if (h.endianType != 1)
+        throw FormatError("Unsupported endianType " + std::to_string(h.endianType) +
+                                 " -- only little-endian NIF files are supported.");
+
     h.hasBSHeader = isBethesdaStreamHeaderPresent(h.version, h.userVersion);
     if (h.hasBSHeader) {
         h.bsHeader.bsVersion = r.u32();
         h.bsHeader.author = r.exportString();
-        if (h.bsHeader.bsVersion > 130) { r.u32(); /* Unknown Int */ }
-        else h.bsHeader.processOrExportScript1 = r.exportString();
+        // writeHeader cannot reproduce the "Unknown Int" that bsVersion > 130
+        // files carry (it writes 0), so reject rather than silently drop it.
+        // Never hit by Fallout 3/NV (BS version 34).
+        if (h.bsHeader.bsVersion > 130)
+            throw FormatError("Unsupported BS version " +
+                                     std::to_string(h.bsHeader.bsVersion));
+        h.bsHeader.processOrExportScript1 = r.exportString();
         h.bsHeader.exportScript2 = r.exportString();
         if (h.bsHeader.bsVersion >= 103) h.bsHeader.maxFilepath = r.exportString();
     } else {
-        throw std::runtime_error(
+        throw FormatError(
             "This NIF has no BSStreamHeader (not a Bethesda export) -- this "
             "tool targets Bethesda Fallout 3/NV .kf files specifically.");
     }
 
     h.numBlockTypes = r.u16();
+    // Each count below is checked against the remaining bytes before the
+    // container is sized (see ByteReader::count).
+    r.count(h.numBlockTypes, 4);
     h.blockTypes.resize(h.numBlockTypes);
     for (uint16_t i = 0; i < h.numBlockTypes; ++i) h.blockTypes[i] = r.sizedString();
 
+    r.count(h.numBlocks, 2);
     h.blockTypeIndex.resize(h.numBlocks);
     for (uint32_t i = 0; i < h.numBlocks; ++i) h.blockTypeIndex[i] = r.u16();
 
     // Block Size array requires version >= 20.2.0.5; guaranteed for us.
+    r.count(h.numBlocks, 4);
     h.blockSizes.resize(h.numBlocks);
     for (uint32_t i = 0; i < h.numBlocks; ++i) h.blockSizes[i] = r.u32();
 
     h.numStrings = r.u32();
     h.maxStringLength = r.u32();
+    r.count(h.numStrings, 4);
     h.strings.resize(h.numStrings);
     for (uint32_t i = 0; i < h.numStrings; ++i) h.strings[i] = r.sizedString();
 
     h.numGroups = r.u32();
+    r.count(h.numGroups, 4);
     h.groups.resize(h.numGroups);
     for (uint32_t i = 0; i < h.numGroups; ++i) h.groups[i] = r.u32();
 

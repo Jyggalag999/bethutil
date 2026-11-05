@@ -42,10 +42,9 @@ struct Settings
     // use_tolerance. 0 = auto (ratio- or tolerance-driven).
     int control_points = 0;
 
-    // Hard cap on the adaptive search regardless of keyframe count - protects
-    // against one unusually long/dense animation making a single channel's
-    // O(M^3) fit take an unbounded amount of time. 0 disables the cap.
-    int max_control_points = 400;
+    // Optional cap on control points per bone. 0 = no cap (the default):
+    // vanilla files go past 1,800 on long clips, and the fit is linear in M.
+    int max_control_points = 0;
 
     // Keep every Nth source keyframe before fitting (1 = keep all).
     int skip = 1;
@@ -106,9 +105,13 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Settings,
 ///
 /// If `diagnostics` is non-null it receives the compressor's log and, on failure, the reason
 /// (a std::error_code can't carry text), so the caller can log it.
+///
+/// If `modified` is non-null it is set to whether the returned bytes differ from `input` (the core's
+/// Result::modified). When false the output is a copy of the input and the caller can skip rewriting it.
 [[nodiscard]] auto compress(std::span<const std::byte> input,
                             const Settings &settings,
-                            std::string *diagnostics = nullptr) noexcept
+                            std::string *diagnostics = nullptr,
+                            bool *modified           = nullptr) noexcept
     -> tl::expected<std::vector<std::byte>, Error>;
 
 } // namespace btu::kf

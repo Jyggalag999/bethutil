@@ -59,11 +59,12 @@ struct Options {
     int skip = 1;                   // keep every Nth source keyframe (1 = no skip)
     bool compact16 = false;
     int forcedControlPoints = 0;    // 0 = auto (ratio- or tolerance-driven)
-    int maxControlPoints = 400;     // hard cap on adaptive search, regardless of
-                                     // sample count -- protects against one
-                                     // pathological (very long/dense) animation
-                                     // making a single channel's O(M^3) fit take
-                                     // an unbounded amount of time. 0 = no cap.
+    int maxControlPoints = 0;       // optional cap on M per bone; 0 = no cap
+                                     // (the default). Vanilla files run past
+                                     // 1,800 control points on long clips and
+                                     // the fit is linear in M, so capping only
+                                     // costs long clips accuracy. The tolerance
+                                     // search is bounded by sample count anyway.
     int minControlPoints = 48;      // floor under --ratio's M, regardless of how
                                      // few samples that ratio implies -- found via
                                      // a real animation (EM_SprintF's sprint-forward
@@ -113,6 +114,7 @@ struct Result {
 // Compresses one .kf file held in memory. Progress/diagnostics go to `log`.
 // Throws std::runtime_error on unrecoverable errors (bad format, etc.); the
 // message says why. Thread-safe: no shared state between calls.
-Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std::ostream& log);
+// `input` is taken by value: pass std::move(buffer) to avoid a copy of the file.
+Result compressBytes(std::vector<uint8_t> input, const Options& opt, std::ostream& log);
 
 } // namespace kfc

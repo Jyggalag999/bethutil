@@ -21,6 +21,12 @@
 #include <string>
 #include <vector>
 
+// Thrown for every malformed / unsupported-file condition (truncated data,
+// bad counts, wrong version, size mismatches). Callers can tell "this is not
+// a file we can handle" apart from genuine internal failures (bad_alloc, bugs)
+// by catching this type.
+struct FormatError : std::runtime_error { using std::runtime_error::runtime_error; };
+
 struct ByteReader {
     const uint8_t* data;
     size_t size;
@@ -30,11 +36,32 @@ struct ByteReader {
     explicit ByteReader(const std::vector<uint8_t>& v) : data(v.data()), size(v.size()) {}
 
     void need(size_t n) const {
-        if (pos + n > size)
-            throw std::runtime_error("ByteReader: unexpected end of data (need " +
+        // Written as n > size - pos (pos <= size is an invariant) rather than
+        // pos + n > size: the sum can wrap on a 32-bit size_t and let a huge
+        // n through.
+        if (n > size - pos)
+            throw FormatError("ByteReader: unexpected end of data (need " +
                                       std::to_string(n) + " bytes at offset " +
                                       std::to_string(pos) + ", have " +
                                       std::to_string(size - pos) + ")");
+    }
+
+    // Validates an element count read from the file BEFORE any container is
+    // sized from it. A corrupt or hostile file can claim 4 billion elements;
+    // resize(n) would commit tens of GB (and for 28-byte keys, much more)
+    // long before the per-field bounds checks ever fire. Every serialized
+    // element occupies at least minElemBytes in the stream, so if the
+    // remaining bytes cannot hold n of them the file is truncated or lying
+    // and we reject it up front. Valid files never trip this. Does not
+    // consume anything; the caller still reads the elements.
+    size_t count(uint32_t n, size_t minElemBytes) const {
+        size_t remaining = size - pos;
+        if (minElemBytes != 0 && n > remaining / minElemBytes)
+            throw FormatError("ByteReader: element count " +
+                                      std::to_string(n) + " exceeds remaining data (" +
+                                      std::to_string(remaining) + " bytes at offset " +
+                                      std::to_string(pos) + ")");
+        return n;
     }
 
     template <typename T>

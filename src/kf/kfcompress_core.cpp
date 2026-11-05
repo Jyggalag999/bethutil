@@ -18,13 +18,10 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
-#include <cstring>
 #include <iostream>
 #include <limits>
-#include <memory>
-#include <optional>
+#include <map>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 
 #include "btu/kf/detail/bspline.hpp"
@@ -79,7 +76,7 @@ static bool isBlacklistedName(const std::string& name, const std::vector<std::st
 
     std::string lower = name;
     std::transform(lower.begin(), lower.end(), lower.begin(),
-                    [](unsigned char c) { return std::tolower(c); });
+                    [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
     if (lower.find("camera") != std::string::npos) return true;
 
     // Shell casing / bullet / projectile prop bones: found by running our
@@ -125,11 +122,6 @@ static Quat eulerXYZToQuat(double rx, double ry, double rz) {
 
 // ---------------------------------------------------------------- sampling
 
-struct Sample {
-    double t; // raw time, not yet normalized
-    std::vector<double> v;
-};
-
 // Linear interpolation lookup within a sorted float KeyGroup (used to
 // resample XYZ-euler axes onto a shared time base). Falls back to boundary
 // clamping outside the key range.
@@ -137,14 +129,16 @@ static double sampleFloatKeyGroup(const KeyGroup<float>& g, double t) {
     if (g.keys.empty()) return 0.0;
     if (g.keys.size() == 1 || t <= g.keys.front().time) return g.keys.front().value;
     if (t >= g.keys.back().time) return g.keys.back().value;
-    for (size_t i = 0; i + 1 < g.keys.size(); ++i) {
-        double t0 = g.keys[i].time, t1 = g.keys[i + 1].time;
-        if (t >= t0 && t <= t1) {
-            double a = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
-            return g.keys[i].value * (1 - a) + g.keys[i + 1].value * a;
-        }
-    }
-    return g.keys.back().value;
+    // Keys are sorted by time and t is strictly inside (front, back) here, so
+    // the first key at or after t closes the segment that holds t. Binary
+    // search instead of a linear scan: XYZ-rotation bones call this once per
+    // key time per axis.
+    auto it = std::lower_bound(g.keys.begin(), g.keys.end(), t,
+        [](const Key<float>& k, double tt) { return k.time < tt; });
+    size_t i = static_cast<size_t>(it - g.keys.begin()) - 1;
+    double t0 = g.keys[i].time, t1 = g.keys[i + 1].time;
+    double a = (t1 > t0) ? (t - t0) / (t1 - t0) : 0.0;
+    return g.keys[i].value * (1 - a) + g.keys[i + 1].value * a;
 }
 
 static std::vector<double> decimateKeepEnds(const std::vector<double>& times, int skip) {
@@ -387,6 +381,18 @@ static ChannelFit fitRotationChannel(const TransformData& d, int skip, double ra
     return cf;
 }
 
+// True when every control point of every present channel is finite. A
+// degenerate least-squares solve could in principle produce NaN/Inf even from
+// finite keys (those are rejected up front, see allFinite), and std::lround on
+// a non-finite value is undefined behaviour in appendChannel's compact path.
+static bool jobControlPointsFinite(const BoneJob& job) {
+    for (const ChannelFit* cf : {&job.translation, &job.rotation, &job.scale}) {
+        if (!cf->present) continue;
+        if (!allFinite(cf->fit.controlPoints)) return false;
+    }
+    return true;
+}
+
 // Appends one channel's control points into the shared pool (float or
 // compact int16), returning the element offset ("Handle") of its first
 // control point.
@@ -436,10 +442,10 @@ static uint32_t appendChannel(const ChannelFit& cf, bool compact,
 
 // ---------------------------------------------------------------- compressBytes
 
-Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std::ostream& log) {
+Result compressBytes(std::vector<uint8_t> input, const Options& opt, std::ostream& log) {
     Result result;
 
-    std::vector<uint8_t> raw = input;
+    std::vector<uint8_t> raw = std::move(input);
     result.inputBytes = raw.size();
 
     // ---- Optional lossless pre-pass: remove excess repeated keys before
@@ -465,7 +471,6 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     if (opt.dedupe) {
         kfdedupe::DedupePassResult pass = kfdedupe::dedupeFileBytes(raw, opt.dedupeEpsilon);
         if (pass.changed) {
-            if (!opt.dedupeOnly) fitRaw = raw;
             result.dedupeBlocksTouched = pass.blocksTouched;
             result.dedupeKeysRemoved = pass.keysRemoved;
             if (opt.verbose) {
@@ -473,6 +478,10 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
                     << pass.blocksTouched << " block(s) (" << raw.size() << " -> " << pass.bytes.size() << " bytes)\n";
                 for (auto& line : pass.verboseLines) log << "  " << line << "\n";
             }
+            // The pre-dedupe bytes become the fit source; `raw` takes the
+            // deduped bytes. Moved, not copied: nothing reads the old `raw`
+            // after this point except through `fitRaw`.
+            if (!opt.dedupeOnly) fitRaw = std::move(raw);
             raw = std::move(pass.bytes);
         }
     }
@@ -485,9 +494,9 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
         if (result.dedupeBlocksTouched == 0) {
             log << "No repeated keys found to remove.\n";
             if (!opt.dryRun) {
-                result.bytes = raw;
-                result.wroteFile = true;
                 result.outputBytes = raw.size();
+                result.bytes = std::move(raw);
+                result.wroteFile = true;
             }
             return result;
         }
@@ -496,14 +505,14 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
                 << result.dedupeKeysRemoved << " key(s) would be removed.\n";
             return result;
         }
-        result.bytes = raw;
+        result.outputBytes = raw.size();
+        result.bytes = std::move(raw);
         result.modified = true;
         result.wroteFile = true;
-        result.outputBytes = raw.size();
         log << "Deduped " << result.dedupeBlocksTouched << " block(s), removed "
             << result.dedupeKeysRemoved << " key(s).\n"
-            << "  File size: " << result.inputBytes << " -> " << raw.size() << " bytes ("
-            << (100.0 * (double)raw.size() / (double)result.inputBytes) << "%)\n";
+            << "  File size: " << result.inputBytes << " -> " << result.outputBytes << " bytes ("
+            << (100.0 * (double)result.outputBytes / (double)result.inputBytes) << "%)\n";
         return result;
     }
 
@@ -524,7 +533,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     // per-file try/catch could see it.
     for (uint32_t i = 0; i < header.numBlocks; ++i) {
         if (header.blockTypeIndex[i] >= header.blockTypes.size()) {
-            throw std::runtime_error(
+            throw FormatError(
                 "Block " + std::to_string(i) + " has an out-of-range block-type index "
                 "(" + std::to_string(header.blockTypeIndex[i]) + " >= " +
                 std::to_string(header.blockTypes.size()) + " known types) -- file is "
@@ -547,7 +556,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
         // buffer over-read. Must hard-fail here, not just warn, and
         // before any block gets read.
         if (cursor > raw.size()) {
-            throw std::runtime_error(
+            throw FormatError(
                 "Block " + std::to_string(i) + "'s declared size runs past the end of "
                 "the file (file is truncated or the block-size table is corrupt).");
         }
@@ -577,7 +586,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
             fc += fitHeader.blockSizes[i];
         }
         if (fc > fitRaw.size())
-            throw std::runtime_error("Original file's block-size table runs past the end of the file.");
+            throw FormatError("Original file's block-size table runs past the end of the file.");
         fitBase = fitRaw.data();
         fitBlockSizes = fitHeader.blockSizes;
     }
@@ -629,6 +638,39 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
             jobs.push_back(job);
         }
     }
+    // Converting a bone replaces its NiTransformData block with an empty
+    // placeholder. If any OTHER NiTransformInterpolator that we are not
+    // converting (blacklisted name, not a candidate, orphaned, ...) points at
+    // the same data block, it would silently lose its animation. Exporters
+    // give every interpolator its own block so this is not expected in
+    // practice, but leaving such a bone as plain keys is the safe outcome.
+    {
+        std::map<int, int> referrers;    // data block -> NiTransformInterpolator count (all)
+        std::map<int, int> jobReferrers; // data block -> jobs pointing at it
+        for (uint32_t i = 0; i < header.numBlocks; ++i) {
+            if (blockType(i) != "NiTransformInterpolator") continue;
+            try {
+                ByteReader ir(raw.data() + blockOffset[i], header.blockSizes[i]);
+                TransformInterpolator ti = TransformInterpolator::read(ir, header.blockSizes[i]);
+                ++referrers[ti.dataRef];
+            } catch (const std::exception&) {
+                // Unparseable interpolators are left alone (and never become jobs).
+            }
+        }
+        for (auto& job : jobs) ++jobReferrers[job.dataBlockIdx];
+        std::vector<BoneJob> unshared;
+        unshared.reserve(jobs.size());
+        for (auto& job : jobs) {
+            if (referrers[job.dataBlockIdx] > jobReferrers[job.dataBlockIdx]) {
+                if (opt.verbose) log << "Skipping bone \"" << job.name << "\" (interp#" << job.interpBlockIdx
+                                     << "): its key data (block " << job.dataBlockIdx
+                                     << ") is shared with an interpolator that is not being converted\n";
+                continue;
+            }
+            unshared.push_back(std::move(job));
+        }
+        jobs = std::move(unshared);
+    }
     result.bonesSkippedBlacklist = skippedByBlacklist;
     if (skippedByBlacklist && !opt.verbose) {
         log << "Skipped " << skippedByBlacklist << " blacklisted bone(s) "
@@ -656,10 +698,10 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
             // --dedupe, `raw` may already differ from the on-disk original
             // even though no bone was B-spline-eligible, so that case must
             // still write.
-            result.bytes = raw;
+            result.outputBytes = raw.size();
+            result.bytes = std::move(raw);
             result.modified = result.dedupeBlocksTouched > 0;
             result.wroteFile = true;
-            result.outputBytes = raw.size();
         }
         return result;
     }
@@ -772,8 +814,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
                 << " on at least one bone -- some channels are less accurate "
                    "than requested. This usually means an unusually long/dense "
                    "source animation; raise --max-control-points if you need "
-                   "tighter accuracy (fit cost grows with its cube, so raise "
-                   "it cautiously).\n";
+                   "tighter accuracy, or set it to 0 (no cap, the default).\n";
         }
     }
 
@@ -797,7 +838,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     //      making --compact16 output *bigger* than converting everything
     //      unconditionally would have -- caught by comparing real
     //      before/after file sizes, not just counts).
-    if (!opt.forceConvertAll) {
+    {
         size_t bytesPerComponent = opt.compact16 ? 2 : 4;
         size_t newInterpBodySize = opt.compact16 ? 84 : 60;
         constexpr size_t kOldInterpBodySize = 36; // NiQuatTransform(32) + dataRef(4)
@@ -812,6 +853,13 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
         for (size_t j = 0; j < jobs.size(); ++j) {
             auto& job = jobs[j];
             int m = jobM[j];
+            if (!jobControlPointsFinite(job)) {
+                if (opt.verbose) {
+                    log << "Skipping bone \"" << job.name << "\" (interp#" << job.interpBlockIdx
+                        << "): the fit produced a non-finite control point\n";
+                }
+                continue;
+            }
             size_t poolBytes = 0;
             if (job.translation.present) poolBytes += static_cast<size_t>(m) * 3 * bytesPerComponent;
             if (job.rotation.present) poolBytes += static_cast<size_t>(m) * 4 * bytesPerComponent;
@@ -821,7 +869,7 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
             long long netDelta = static_cast<long long>(newInterpBodySize) - static_cast<long long>(kOldInterpBodySize)
                                 + static_cast<long long>(kShrunkDataSize) - static_cast<long long>(originalDataBytes)
                                 + static_cast<long long>(poolBytes);
-            if (netDelta >= 0) {
+            if (!opt.forceConvertAll && netDelta >= 0) {
                 skippedNotWorthwhile++;
                 if (opt.verbose) {
                     log << "Skipping bone \"" << job.name << "\" (interp#" << job.interpBlockIdx
@@ -847,14 +895,14 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
 
         if (jobs.empty()) {
             log << "No bone remained eligible after the size-based conversion check "
-                   "(every candidate would have gotten bigger, not smaller).\n";
+                   "(every candidate would have gotten bigger, not smaller, or had an unusable fit).\n";
             if (!opt.dryRun) {
                 // See the identical note on the other early-return above:
                 // with --dedupe, `raw` may differ from disk even here.
-                result.bytes = raw;
+                result.outputBytes = raw.size();
+                result.bytes = std::move(raw);
                 result.modified = result.dedupeBlocksTouched > 0;
                 result.wroteFile = true;
-                result.outputBytes = raw.size();
             }
             return result;
         }
@@ -930,9 +978,10 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     }
 
     BSplineData sharedData;
-    sharedData.floatControlPoints = floatPool;
-    sharedData.compactControlPoints = compactPool;
+    sharedData.floatControlPoints = std::move(floatPool);
+    sharedData.compactControlPoints = std::move(compactPool);
     auto sharedDataBytes = sharedData.serialize();
+    const size_t sharedDataSize = sharedDataBytes.size();
 
     // ---- Rebuild header block tables ----
     std::string interpTypeName = opt.compact16 ? "NiBSplineCompTransformInterpolator" : "NiBSplineTransformInterpolator";
@@ -952,9 +1001,9 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     std::map<int, std::vector<uint8_t>> replacedBlockBytes;
     for (size_t j = 0; j < jobs.size(); ++j) {
         auto& job = jobs[j];
-        replacedBlockBytes[job.interpBlockIdx] = newInterpBytes[j];
         newBlockTypeIndex[job.interpBlockIdx] = static_cast<uint16_t>(interpTypeIdx);
         newBlockSizes[job.interpBlockIdx] = static_cast<uint32_t>(newInterpBytes[j].size());
+        replacedBlockBytes[job.interpBlockIdx] = std::move(newInterpBytes[j]);
 
         replacedBlockBytes[job.dataBlockIdx] = TransformData::writeEmpty();
         newBlockSizes[job.dataBlockIdx] = static_cast<uint32_t>(replacedBlockBytes[job.dataBlockIdx].size());
@@ -962,16 +1011,16 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
         // NiTransformData, just empty).
     }
     newBlockTypeIndex[sharedSplineDataFinalIndex] = static_cast<uint16_t>(splineDataTypeIdx);
-    replacedBlockBytes[sharedSplineDataFinalIndex] = sharedDataBytes;
-    newBlockSizes[sharedSplineDataFinalIndex] = static_cast<uint32_t>(sharedDataBytes.size());
+    replacedBlockBytes[sharedSplineDataFinalIndex] = std::move(sharedDataBytes);
+    newBlockSizes[sharedSplineDataFinalIndex] = static_cast<uint32_t>(sharedDataSize);
 
     for (auto& [m, blockIdx] : basisIndexForM) {
         BSplineBasisData basis;
         basis.numControlPoints = static_cast<uint32_t>(m);
         auto basisBytes = basis.serialize();
         newBlockTypeIndex[blockIdx] = static_cast<uint16_t>(basisTypeIdx);
-        replacedBlockBytes[blockIdx] = basisBytes;
         newBlockSizes[blockIdx] = static_cast<uint32_t>(basisBytes.size());
+        replacedBlockBytes[blockIdx] = std::move(basisBytes);
     }
 
     header.numBlocks = newNumBlocks;
@@ -991,14 +1040,37 @@ Result compressBytes(const std::vector<uint8_t>& input, const Options& opt, std:
     }
     if (trailerLen) out.raw(raw.data() + trailerStart, trailerLen);
 
+    // The per-bone size check above only weighs each bone's own blocks and
+    // pool bytes. Converting also costs the file a fixed overhead it can't
+    // see: the shared NiBSplineData and per-M basis blocks, their block-type
+    // and block-size table entries, and up to three new type-name strings
+    // (~100 bytes). On small files a handful of bones that each save a few
+    // bytes can lose to that, so the "compressed" file came out bigger (146
+    // of a 12k-file mod batch) -- and lossy for nothing. Measuring the real
+    // serialised size can't be wrong where an up-front estimate could be, so
+    // compare here and fall back to the same output as "no bone eligible".
+    // Against `raw`, i.e. after dedupe, so its lossless savings are kept.
+    // --force-convert-all opts out of size checks, so it opts out of this too.
+    if (!opt.forceConvertAll && out.buf.size() >= raw.size()) {
+        log << "B-spline output (" << out.buf.size() << " bytes) is not smaller than the "
+            << (result.dedupeBlocksTouched > 0 ? "deduped " : "") << "original (" << raw.size()
+            << " bytes); keeping the original keys.\n";
+        result.bonesConverted = 0;
+        result.outputBytes = raw.size();
+        result.bytes = std::move(raw);
+        result.modified = result.dedupeBlocksTouched > 0;
+        result.wroteFile = true;
+        return result;
+    }
+
     result.bytes = std::move(out.buf);
     result.modified = true;
     result.wroteFile = true;
     result.outputBytes = result.bytes.size();
 
-    size_t newControlBytes = sharedDataBytes.size();
+    size_t newControlBytes = sharedDataSize;
     for (auto& [m, blockIdx] : basisIndexForM) newControlBytes += replacedBlockBytes[blockIdx].size();
-    for (size_t j = 0; j < jobs.size(); ++j) newControlBytes += newInterpBytes[j].size();
+    for (size_t j = 0; j < jobs.size(); ++j) newControlBytes += replacedBlockBytes[jobs[j].interpBlockIdx].size();
 
     log << "Converted " << jobs.size() << " bone channel(s).\n";
     if (result.dedupeBlocksTouched > 0) {

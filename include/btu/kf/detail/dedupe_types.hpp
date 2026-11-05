@@ -61,13 +61,9 @@ using nif::KeyType;
 using nif::Quaternion;
 using nif::Vector3;
 
-inline Vector3 readVec3(ByteReader& r) {
-    Vector3 v; v.x = r.f32(); v.y = r.f32(); v.z = r.f32(); return v;
-}
+using nif::readVector3;
+using nif::readQuaternion;
 inline void writeVec3(ByteWriter& w, const Vector3& v) { w.f32(v.x); w.f32(v.y); w.f32(v.z); }
-inline Quaternion readQuat(ByteReader& r) {
-    Quaternion q; q.w = r.f32(); q.x = r.f32(); q.y = r.f32(); q.z = r.f32(); return q;
-}
 inline void writeQuat(ByteWriter& w, const Quaternion& q) { w.f32(q.w); w.f32(q.x); w.f32(q.y); w.f32(q.z); }
 
 // epsilon == 0 is exact bit equality (-0.0f == 0.0f is already true in IEEE
@@ -179,7 +175,7 @@ struct FFloatGroup {
         FFloatGroup g;
         uint32_t n = r.u32();
         if (n == 0) return g;
-        g.interp = static_cast<KeyType>(r.u32());
+        g.interp = nif::checkKeys(r, n, r.u32(), 4);
         g.keys.resize(n);
         for (uint32_t i = 0; i < n; ++i) {
             FFloatKey k;
@@ -213,13 +209,13 @@ struct FVec3Group {
         FVec3Group g;
         uint32_t n = r.u32();
         if (n == 0) return g;
-        g.interp = static_cast<KeyType>(r.u32());
+        g.interp = nif::checkKeys(r, n, r.u32(), 12);
         g.keys.resize(n);
         for (uint32_t i = 0; i < n; ++i) {
             FVec3Key k;
             k.time = r.f32();
-            k.value = readVec3(r);
-            if (g.interp == KeyType::QUADRATIC_KEY) { k.tanFwd = readVec3(r); k.tanBack = readVec3(r); }
+            k.value = readVector3(r);
+            if (g.interp == KeyType::QUADRATIC_KEY) { k.tanFwd = readVector3(r); k.tanBack = readVector3(r); }
             else if (g.interp == KeyType::TBC_KEY) { k.t = r.f32(); k.b = r.f32(); k.c = r.f32(); }
             g.keys[i] = k;
         }
@@ -258,13 +254,16 @@ struct FTransformData {
         FTransformData d;
         d.numRotationKeys = r.u32();
         if (d.numRotationKeys != 0) {
-            d.rotationType = static_cast<KeyType>(r.u32());
+            uint32_t rawType = r.u32();
+            if (rawType != static_cast<uint32_t>(KeyType::XYZ_ROTATION_KEY))
+                d.rotationType = nif::checkKeys(r, d.numRotationKeys, rawType, 16, false);
+            else d.rotationType = KeyType::XYZ_ROTATION_KEY;
             if (d.rotationType != KeyType::XYZ_ROTATION_KEY) {
                 d.quatKeys.resize(d.numRotationKeys);
                 for (uint32_t i = 0; i < d.numRotationKeys; ++i) {
                     FQuatKey k;
                     k.time = r.f32();
-                    k.value = readQuat(r);
+                    k.value = readQuaternion(r);
                     if (d.rotationType == KeyType::TBC_KEY) { k.t = r.f32(); k.b = r.f32(); k.c = r.f32(); }
                     d.quatKeys[i] = k;
                 }
@@ -277,7 +276,7 @@ struct FTransformData {
 
         size_t consumed = r.pos - startPos;
         if (consumed != blockSizeForValidation) {
-            throw std::runtime_error(
+            throw FormatError(
                 "NiTransformData: parsed " + std::to_string(consumed) +
                 " bytes but block size says " + std::to_string(blockSizeForValidation) +
                 " -- this file's NiTransformData layout doesn't match what this tool "
@@ -367,7 +366,7 @@ inline DedupePassResult dedupeFileBytes(const std::vector<uint8_t>& raw, float e
     // project -- a malformed/truncated file must fail cleanly, not crash.
     for (uint32_t i = 0; i < header.numBlocks; ++i) {
         if (header.blockTypeIndex[i] >= header.blockTypes.size()) {
-            throw std::runtime_error(
+            throw FormatError(
                 "Block " + std::to_string(i) + " has an out-of-range block-type index "
                 "(" + std::to_string(header.blockTypeIndex[i]) + " >= " +
                 std::to_string(header.blockTypes.size()) + " known types) -- file is "
@@ -381,7 +380,7 @@ inline DedupePassResult dedupeFileBytes(const std::vector<uint8_t>& raw, float e
         blockOffset[i] = cursor;
         cursor += header.blockSizes[i];
         if (cursor > raw.size()) {
-            throw std::runtime_error(
+            throw FormatError(
                 "Block " + std::to_string(i) + "'s declared size runs past the end of "
                 "the file (file is truncated or the block-size table is corrupt).");
         }

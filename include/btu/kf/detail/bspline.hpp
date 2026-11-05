@@ -37,25 +37,38 @@ inline std::vector<double> clampedUniformKnots(int M, int p) {
     return k;
 }
 
+// One sample's row of the basis matrix, stored sparsely. A degree-p basis
+// row has at most p+1 nonzeros, all consecutive: N_{base..base+p}(t). The
+// fit used to keep the full dense S x M matrix, which is O(S*M) memory and
+// time -- harmless while M was capped at a few hundred, but with no cap a
+// long clip (M and S both grow with duration) makes it quadratic: a
+// 10-minute cutscene would need gigabytes per channel per worker thread.
+// Every consumer below only ever reads these p+1 entries (the rest are
+// exact zeros, and adding a zero never changes a floating-point sum), so
+// the results are bit-identical to the dense version.
+struct BasisRow {
+    int base = 0;                 // index of v[0]; base..base+p are all < M
+    double v[kDegree + 1] = {};
+};
+
 // Cox-de Boor recursive basis function N_{i,p}(t) via the standard
 // dynamic-programming table (O(p^2) per evaluation).
-inline void basisRow(const std::vector<double>& knots, int M, int p, double t,
-                      std::vector<double>& outN /* size M */) {
-    outN.assign(M, 0.0);
-    // find knot span
+inline BasisRow basisRow(const std::vector<double>& knots, int M, int p, double t) {
     int n = M - 1; // highest control point index
     if (t >= knots[n + 1]) t = std::nextafter(knots[n + 1], -1.0);
     if (t < knots[p]) t = knots[p];
 
-    // Table of basis values via triangular recurrence.
-    std::vector<double> N(p + 1, 0.0);
-    int span = p;
-    for (int i = p; i <= n; ++i) {
-        if (t >= knots[i] && t < knots[i + 1]) { span = i; break; }
-        if (i == n) span = n; // last span is closed on the right
-    }
+    // Find the knot span: the i in [p, n] with knots[i] <= t < knots[i+1],
+    // the last span being closed on the right. knots[p..n+1] is strictly
+    // increasing for a clamped uniform vector, so a binary search finds the
+    // same span the old linear scan did (that scan alone made every row
+    // O(M)); a NaN t falls through to n in both.
+    auto it = std::upper_bound(knots.begin() + p + 1, knots.begin() + n + 1, t);
+    int span = int(it - knots.begin()) - 1;
 
-    std::vector<double> left(p + 1), right(p + 1);
+    // Table of basis values via triangular recurrence.
+    double N[kDegree + 1] = {};
+    double left[kDegree + 1] = {}, right[kDegree + 1] = {};
     N[0] = 1.0;
     for (int j = 1; j <= p; ++j) {
         left[j] = t - knots[span + 1 - j];
@@ -69,10 +82,10 @@ inline void basisRow(const std::vector<double>& knots, int M, int p, double t,
         }
         N[j] = saved;
     }
-    for (int j = 0; j <= p; ++j) {
-        int idx = span - p + j;
-        if (idx >= 0 && idx < M) outN[idx] = N[j];
-    }
+    BasisRow row;
+    row.base = span - p;
+    for (int j = 0; j <= p; ++j) row.v[j] = N[j];
+    return row;
 }
 
 // Solve (A^T A) x = A^T b for several right-hand-side columns at once.
@@ -92,27 +105,32 @@ inline void basisRow(const std::vector<double>& knots, int M, int p, double t,
 //
 // Storage: band[i][k] holds ATA[i][i+k] (upper triangle, k = 0..W).
 inline std::vector<std::vector<double>> solveNormalEquations(
-    const std::vector<std::vector<double>>& A,             // S x M
+    const std::vector<BasisRow>& A,                        // S rows, M columns
+    size_t M,
     const std::vector<std::vector<double>>& rhsColumns) {  // C columns, each length S
     size_t S = A.size();
-    size_t M = S ? A[0].size() : 0;
     size_t C = rhsColumns.size();
     const size_t W = size_t(std::max(kDegree, 2));
 
     // Build banded normal matrix ATA (M x (W+1)) and ATb (M x C). Each
     // basis row's nonzeros all sit inside [first, first+W], so only that
-    // window is visited instead of the full row.
+    // window is visited. `first` is the first NONZERO entry (an exact-knot
+    // t can zero the leading value), matching the dense scan this replaced
+    // so the accumulation order, and therefore every rounding, is unchanged.
     std::vector<std::vector<double>> band(M, std::vector<double>(W + 1, 0.0));
     std::vector<std::vector<double>> ATb(M, std::vector<double>(C, 0.0));
     for (size_t s = 0; s < S; ++s) {
-        const auto& row = A[s];
-        size_t first = 0;
-        while (first < M && row[first] == 0.0) ++first;
+        const BasisRow& row = A[s];
+        const size_t base = size_t(row.base);
+        auto at = [&](size_t i) { return i - base <= size_t(kDegree) ? row.v[i - base] : 0.0; };
+        size_t first = base;
+        while (first <= base + kDegree && row.v[first - base] == 0.0) ++first;
+        if (first > base + kDegree) continue; // all-zero row contributes nothing
         size_t last = std::min(M, first + W + 1);
         for (size_t i = first; i < last; ++i) {
-            double ai = row[i];
+            double ai = at(i);
             if (ai == 0.0) continue;
-            for (size_t j = i; j < last; ++j) band[i][j - i] += ai * row[j];
+            for (size_t j = i; j < last; ++j) band[i][j - i] += ai * at(j);
             for (size_t c = 0; c < C; ++c) ATb[i][c] += ai * rhsColumns[c][s];
         }
     }
@@ -244,8 +262,8 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
 
     auto knots = clampedUniformKnots(M, p);
 
-    std::vector<std::vector<double>> A(S, std::vector<double>(M));
-    for (size_t s = 0; s < S; ++s) basisRow(knots, M, p, ts[s], A[s]);
+    std::vector<BasisRow> A(S);
+    for (size_t s = 0; s < S; ++s) A[s] = basisRow(knots, M, p, ts[s]);
 
     size_t C = values.empty() ? 0 : values[0].size();
 
@@ -277,21 +295,22 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
     for (size_t s = 0; s < S; ++s)
         for (size_t c = 0; c < C; ++c) rhsColumns[c][s] = values[s][c] - mean[c];
 
-    auto solved = solveNormalEquations(A, rhsColumns); // [C][M], deviations from mean
+    auto solved = solveNormalEquations(A, size_t(M), rhsColumns); // [C][M], deviations from mean
 
     FitResult out;
     out.controlPoints.assign(M, std::vector<double>(C));
     for (int i = 0; i < M; ++i)
         for (size_t c = 0; c < C; ++c) out.controlPoints[i][c] = solved[c][i] + mean[c];
 
-    // Reconstruction error check.
+    // Reconstruction error check. Only the row's p+1 entries can be nonzero,
+    // and summing them in ascending index order gives the same result as the
+    // full dense dot product did (the skipped terms are all exact zeros).
     double maxErr = 0.0;
-    std::vector<double> row(M);
     for (size_t s = 0; s < S; ++s) {
-        basisRow(knots, M, p, ts[s], row);
+        const BasisRow& row = A[s];
         for (size_t c = 0; c < C; ++c) {
             double rec = 0.0;
-            for (int i = 0; i < M; ++i) rec += row[i] * out.controlPoints[i][c];
+            for (int j = 0; j <= p; ++j) rec += row.v[j] * out.controlPoints[row.base + j][c];
             maxErr = std::max(maxErr, std::fabs(rec - values[s][c]));
         }
     }
@@ -300,16 +319,15 @@ inline FitResult fitBSpline(const std::vector<double>& ts,
 }
 
 // Picks a small M in [minM, maxM] with reconstruction error <= tol.
-// Each individual fit is O(S*M) (building the dense S x M basis matrix and
-// the error check; the banded solve itself is linear in M), so a naive
-// linear scan of every M from minM..maxM is O(maxM) *fits*, each growing
-// with M -- for an animation with an unusually large number of keyframes
+// Each individual fit is O(S log M + M) (sparse basis rows, banded solve),
+// but a naive linear scan of every M from minM..maxM is still O(maxM)
+// *fits* -- for an animation with an unusually large number of keyframes
 // (large maxM), this combination can make one single channel's search
 // take a long time. Exponential search for a working upper
 // bound, then binary search within it, cuts this to O(log maxM) fits
-// instead. Callers should also externally cap maxM (see
-// Options::maxControlPoints in main.cpp) since even O(log maxM) fits
-// doesn't bound the cost of the single largest fit attempted.
+// instead. maxM is the sample count unless the caller sets
+// Options::maxControlPoints; with sparse basis rows each fit is linear in
+// S and M, so even the largest attempt stays cheap.
 inline FitResult fitBSplineAdaptive(const std::vector<double>& ts,
                                      const std::vector<std::vector<double>>& values,
                                      double tolerance, int minM, int maxM) {
