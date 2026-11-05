@@ -20,6 +20,7 @@
 // BSStreamHeader version, which we read from the file itself.
 #pragma once
 #include <cstdint>
+#include <cstdio>
 #include <map>
 #include <optional>
 #include <set>
@@ -438,8 +439,12 @@ inline Header readHeader(ByteReader& r) {
     h.numBlocks = r.u32();
 
     if (h.version != kSupportedVersion) {
+        // Format as real hex: std::to_string would print the decimal value
+        // after the "0x" prefix, which reads like a bogus hex number.
+        char hex[9];
+        std::snprintf(hex, sizeof(hex), "%08X", h.version);
         throw std::runtime_error(
-            "Unsupported NIF version 0x" + std::to_string(h.version) +
+            std::string("Unsupported NIF version 0x") + hex +
             " -- this tool only supports version 20.2.0.7 (0x14020007), i.e. "
             "Fallout 3 / Fallout New Vegas / late-patch Oblivion .kf files.");
     }
