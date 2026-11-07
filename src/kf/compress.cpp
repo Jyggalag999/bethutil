@@ -44,6 +44,9 @@ auto compress(std::span<const std::byte> input,
         {
             kfc::Options opt;
             opt.ratio               = settings.ratio;
+            opt.maxRotDeg           = settings.max_rot_deg;
+            opt.maxTrans            = settings.max_trans;
+            opt.maxScale            = settings.max_scale;
             opt.useTolerance        = settings.use_tolerance;
             opt.tolerance           = settings.tolerance;
             opt.skip                = settings.skip;

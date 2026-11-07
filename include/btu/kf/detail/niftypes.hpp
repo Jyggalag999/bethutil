@@ -75,9 +75,9 @@ template <typename T>
 struct Key {
     float time = 0;
     T value{};
-    // forward/backward tangents (QUADRATIC_KEY) or TBC (TBC_KEY) are parsed
-    // but discarded: this compressor refits a fresh spline through key
-    // *values* only, which is an intentional, documented approximation.
+    // QUADRATIC_KEY tangents, in file order (tanA first). TBC parameters are
+    // parsed but not kept: bones with TBC keys are left uncompressed.
+    T tanA{}, tanB{};
 };
 
 template <typename T>
@@ -125,7 +125,7 @@ inline KeyGroup<float> readFloatKeyGroup(ByteReader& r) {
         Key<float> k;
         k.time = r.f32();
         k.value = r.f32();
-        if (g.interpolation == KeyType::QUADRATIC_KEY) { r.f32(); r.f32(); } // fwd/back, discarded
+        if (g.interpolation == KeyType::QUADRATIC_KEY) { k.tanA = r.f32(); k.tanB = r.f32(); }
         else if (g.interpolation == KeyType::TBC_KEY) { r.f32(); r.f32(); r.f32(); }
         g.keys[i] = k;
     }
@@ -142,7 +142,7 @@ inline KeyGroup<Vector3> readVector3KeyGroup(ByteReader& r) {
         Key<Vector3> k;
         k.time = r.f32();
         k.value = readVector3(r);
-        if (g.interpolation == KeyType::QUADRATIC_KEY) { readVector3(r); readVector3(r); }
+        if (g.interpolation == KeyType::QUADRATIC_KEY) { k.tanA = readVector3(r); k.tanB = readVector3(r); }
         else if (g.interpolation == KeyType::TBC_KEY) { r.f32(); r.f32(); r.f32(); }
         g.keys[i] = k;
     }

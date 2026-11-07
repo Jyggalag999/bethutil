@@ -27,11 +27,18 @@ using common::Error;
 /// --no-blacklist/--force-convert-all flags one-for-one.
 struct Settings
 {
-    // Control-point count = round(ratio * original key count), one-shot
-    // least-squares fit, no search - the actual Gamebryo NiAnimationCompression
-    // algorithm per the official SDK docs, and empirically the closest match
-    // to real vanilla-compressed files (see kfcompress's README/PROJECT_SUMMARY).
+    // Starting guess for each bone's control-point count: round(0.5 * ratio * ~61 Hz sample count),
+    // the rule that matches real vanilla-compressed files. With the error budget below (the default
+    // mode) it is only where the per-bone search begins; the budget is the contract.
     double ratio = 0.80;
+
+    // Error budget. Each bone gets the smallest control-point count whose quantised curve, decoded the
+    // way the engine decodes it, stays within these of the source at every key and every midpoint
+    // between keys closer than 0.2 s. A bone no count satisfies stays as plain (deduped) keys.
+    // 0 disables the check for that channel type. Ignored with use_tolerance / control_points.
+    double max_rot_deg = 0.25;  // degrees of rotation
+    double max_trans   = 0.05;  // game units
+    double max_scale   = 0.001;
 
     // Switches to the old adaptive-search mode instead of ratio: find the
     // smallest control-point count whose max reconstruction error is <= tolerance.
@@ -80,9 +87,12 @@ struct Settings
     std::vector<std::u8string> blacklist_add;
 };
 
-// _WITH_DEFAULT: profiles saved before min_control_points/dedupe existed still load.
+// _WITH_DEFAULT: profiles saved before min_control_points/dedupe/the error budget existed still load.
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Settings,
                                    ratio,
+                                   max_rot_deg,
+                                   max_trans,
+                                   max_scale,
                                    use_tolerance,
                                    tolerance,
                                    control_points,

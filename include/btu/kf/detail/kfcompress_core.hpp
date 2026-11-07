@@ -85,11 +85,24 @@ struct Options {
                                      // compression on short animations (never raises
                                      // M above the sample count itself or above
                                      // --max-control-points). 0 = no floor.
+    // ---- error budget (default mode) ----
+    // Each bone's M is chosen so the quantised, engine-decoded curve stays within
+    // these of the source at every key and every midpoint between keys closer
+    // than 0.2 s. --ratio only supplies the starting M. A bone for which no M
+    // passes stays as plain (deduped) keys. 0 disables the check for that channel
+    // type; with all three 0 the ratio's M is used unverified. Ignored with
+    // --control-points and --tolerance.
+    double maxRotDeg = 0.25;   // degrees of rotation
+    double maxTrans = 0.05;    // game units
+    double maxScale = 0.001;
     bool verbose = false;
     bool dryRun = false;
     bool noBlacklist = false;
     std::vector<std::string> extraBlacklist;
     bool forceConvertAll = false; // skip the "would this actually shrink?" eligibility check
+    bool keepPlaceholders = false; // keep 12-byte empty NiTransformData blocks instead of removing them
+    bool noStaticChannels = false; // keep fully-constant channels as fitted splines instead of static pose values
+    bool noShortClipSkip = false;  // convert clips shorter than ~4 frames at 61 Hz too
     bool dedupe = false; // run kfdedupe's lossless repeated-key removal as a pre-pass
     float dedupeEpsilon = 0.0f; // only meaningful with --dedupe; see --epsilon help text
     bool dedupeOnly = false; // run ONLY the dedupe pass, skip B-spline conversion entirely
@@ -103,6 +116,7 @@ struct Result {
     size_t bonesConverted = 0;
     size_t bonesSkippedBlacklist = 0;
     size_t bonesSkippedNotWorthwhile = 0;
+    size_t bonesKeptLossless = 0; // no M met the error budget (or NaN source keys)
     size_t dedupeBlocksTouched = 0;
     size_t dedupeKeysRemoved = 0;
     size_t inputBytes = 0, outputBytes = 0;
