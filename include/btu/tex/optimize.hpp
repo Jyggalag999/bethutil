@@ -64,6 +64,9 @@ struct OptimizationSteps
     bool mipmaps               = false;
     DXGI_FORMAT best_format    = DXGI_FORMAT_UNKNOWN;
     bool convert               = false;
+    // DXT5/BC3 whose alpha is fully opaque, re-stored as DXT1/BC1 (half the size). When it is the
+    // only step, optimize() copies the colour blocks instead of re-encoding, so it is lossless.
+    bool bc3_to_bc1 = false;
 
     auto operator<=>(const OptimizationSteps &) const noexcept = default;
 };

@@ -18,6 +18,10 @@
 namespace btu::tex {
 auto optimize(Texture &&file, OptimizationSteps sets, CompressionDevice &dev) noexcept -> Result
 {
+    // Only change is DXT5 -> DXT1: copy the colour blocks, no decode/re-encode, no quality loss.
+    if (sets.bc3_to_bc1 && !sets.convert && !sets.resize && !sets.add_transparent_alpha && !sets.mipmaps)
+        return bc3_to_bc1(std::move(file));
+
     const auto &info = file.get().GetMetadata();
     // All operations require a decompressed texture.
     const auto must_decompress = DirectX::IsCompressed(info.format);
@@ -264,6 +268,21 @@ auto compute_optimization_steps(const Texture &file, const Settings &sets) noexc
 
     // I prefer to keep steps independent, but this one has to depend on add_transparent_alpha. If we add an alpha, the output format must have alpha
     res.best_format = best_output_format(file, sets, res.add_transparent_alpha);
+
+    // DXT5 with a fully opaque alpha: the alpha half of every block is wasted. Store it as DXT1, but
+    // only when compression is on, already-compressed files may be touched, the game's no-alpha
+    // compressed format is that same BC1, and nothing is adding an alpha.
+    if (sets.compress && !sets.compress_uncompressed_only && !res.add_transparent_alpha)
+    {
+        const auto bc1 = bc1_counterpart(info.format);
+        const bool allowed = !sets.use_format_whitelist || common::contains(sets.allowed_formats, bc1);
+        if (bc1 != DXGI_FORMAT_UNKNOWN && allowed && bc1 == sets.output_format.compressed_without_alpha
+            && bc3_alpha_all_opaque(tex))
+        {
+            res.bc3_to_bc1  = true;
+            res.best_format = bc1;
+        }
+    }
 
     return res;
 }

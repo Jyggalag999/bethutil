@@ -4,6 +4,8 @@
 #include <btu/tex/functions.hpp>
 
 #include <algorithm>
+#include <cstdint>
+#include <cstring>
 
 namespace btu::tex {
 auto decompress(Texture &&file) -> Result
@@ -249,6 +251,160 @@ auto resize(Texture &&file, Dimension dim) -> Result
         return tl::make_unexpected(error_from_hresult(hr));
 
     file.set(std::move(timage));
+    return std::move(file);
+}
+
+auto bc1_counterpart(const DXGI_FORMAT bc3) noexcept -> DXGI_FORMAT
+{
+    switch (bc3)
+    {
+        case DXGI_FORMAT_BC3_UNORM: return DXGI_FORMAT_BC1_UNORM;
+        case DXGI_FORMAT_BC3_UNORM_SRGB: return DXGI_FORMAT_BC1_UNORM_SRGB;
+        case DXGI_FORMAT_BC3_TYPELESS: return DXGI_FORMAT_BC1_TYPELESS;
+        default: return DXGI_FORMAT_UNKNOWN;
+    }
+}
+
+namespace {
+constexpr size_t k_bc3_block_bytes = 16;
+constexpr size_t k_bc1_block_bytes = 8;
+
+[[nodiscard]] auto block_count(const size_t pixels) noexcept -> size_t
+{
+    return std::max<size_t>(1, (pixels + 3) / 4);
+}
+
+/// One BC3 alpha block (8 bytes): every one of its 16 texels decodes to exactly 255.
+[[nodiscard]] auto alpha_block_opaque(const uint8_t *block) noexcept -> bool
+{
+    const uint8_t a0 = block[0];
+    const uint8_t a1 = block[1];
+
+    uint64_t bits = 0;
+    for (int i = 5; i >= 0; --i)
+        bits = (bits << 8) | block[2 + i];
+
+    for (int t = 0; t < 16; ++t)
+    {
+        const auto idx = static_cast<unsigned>((bits >> (3 * t)) & 7U);
+        bool opaque    = false;
+        if (idx == 0)
+            opaque = a0 == 255;
+        else if (idx == 1)
+            opaque = a1 == 255;
+        else if (a0 <= a1 && idx == 6)
+            opaque = false; // explicit 0
+        else if (a0 <= a1 && idx == 7)
+            opaque = true; // explicit 255
+        else
+            opaque = a0 == 255 && a1 == 255; // interpolated: exact only when both ends are 255
+        if (!opaque)
+            return false;
+    }
+    return true;
+}
+} // namespace
+
+auto bc3_alpha_all_opaque(const ScratchImage &tex) noexcept -> bool
+{
+    if (bc1_counterpart(tex.GetMetadata().format) == DXGI_FORMAT_UNKNOWN)
+        return false;
+
+    const auto *images = tex.GetImages();
+    for (size_t i = 0; i < tex.GetImageCount(); ++i)
+    {
+        const auto &img   = images[i];
+        const auto bw     = block_count(img.width);
+        const auto bh     = block_count(img.height);
+        if (img.pixels == nullptr || img.rowPitch < bw * k_bc3_block_bytes)
+            return false;
+        for (size_t by = 0; by < bh; ++by)
+        {
+            const auto *row = img.pixels + by * img.rowPitch;
+            for (size_t bx = 0; bx < bw; ++bx)
+                if (!alpha_block_opaque(row + bx * k_bc3_block_bytes))
+                    return false;
+        }
+    }
+    return true;
+}
+
+auto bc3_to_bc1(Texture &&file) -> Result
+{
+    const auto &tex  = file.get();
+    const auto &info = tex.GetMetadata();
+    const auto out_format = bc1_counterpart(info.format);
+    if (out_format == DXGI_FORMAT_UNKNOWN)
+        return tl::make_unexpected(Error(TextureErr::BadInput));
+
+    auto out_info   = info;
+    out_info.format = out_format;
+    // Alpha is gone; tell readers so (DDS header alpha mode).
+    out_info.SetAlphaMode(DirectX::TEX_ALPHA_MODE_OPAQUE);
+
+    ScratchImage out;
+    if (const auto hr = out.Initialize(out_info); FAILED(hr))
+        return tl::make_unexpected(error_from_hresult(hr));
+    if (out.GetImageCount() != tex.GetImageCount())
+        return tl::make_unexpected(Error(TextureErr::Unknown));
+
+    const auto *src_images = tex.GetImages();
+    const auto *dst_images = out.GetImages();
+    for (size_t i = 0; i < tex.GetImageCount(); ++i)
+    {
+        const auto &src = src_images[i];
+        const auto &dst = dst_images[i];
+        const auto bw   = block_count(src.width);
+        const auto bh   = block_count(src.height);
+        if (src.pixels == nullptr || dst.pixels == nullptr || src.width != dst.width
+            || src.height != dst.height || src.rowPitch < bw * k_bc3_block_bytes
+            || dst.rowPitch < bw * k_bc1_block_bytes)
+            return tl::make_unexpected(Error(TextureErr::Unknown));
+
+        for (size_t by = 0; by < bh; ++by)
+        {
+            const auto *src_row = src.pixels + by * src.rowPitch;
+            auto *dst_row       = dst.pixels + by * dst.rowPitch;
+            for (size_t bx = 0; bx < bw; ++bx)
+            {
+                // A BC3 block is 8 bytes of alpha, then a colour block laid out like BC1's but always
+                // decoded in 4-colour mode. BC1 uses 4-colour mode only when c0 > c1.
+                const auto *c = src_row + bx * k_bc3_block_bytes + 8;
+                auto *d       = dst_row + bx * k_bc1_block_bytes;
+
+                const auto c0 = static_cast<uint16_t>(c[0] | (c[1] << 8));
+                const auto c1 = static_cast<uint16_t>(c[2] | (c[3] << 8));
+                uint32_t idx  = static_cast<uint32_t>(c[4]) | (static_cast<uint32_t>(c[5]) << 8)
+                               | (static_cast<uint32_t>(c[6]) << 16) | (static_cast<uint32_t>(c[7]) << 24);
+
+                uint16_t o0 = c0;
+                uint16_t o1 = c1;
+                if (c0 == c1)
+                {
+                    idx = 0; // every 4-colour palette entry equals c0; index 0 avoids BC1's transparent slot
+                }
+                else if (c0 < c1)
+                {
+                    // Swap endpoints: palette entries 0<->1 and 2<->3 trade places, so flip the low bit
+                    // of every 2-bit index. (2*a+b)/3 with the ends swapped is the same colour.
+                    o0 = c1;
+                    o1 = c0;
+                    idx ^= 0x55555555U;
+                }
+
+                d[0] = static_cast<uint8_t>(o0 & 0xFF);
+                d[1] = static_cast<uint8_t>(o0 >> 8);
+                d[2] = static_cast<uint8_t>(o1 & 0xFF);
+                d[3] = static_cast<uint8_t>(o1 >> 8);
+                d[4] = static_cast<uint8_t>(idx & 0xFF);
+                d[5] = static_cast<uint8_t>((idx >> 8) & 0xFF);
+                d[6] = static_cast<uint8_t>((idx >> 16) & 0xFF);
+                d[7] = static_cast<uint8_t>(idx >> 24);
+            }
+        }
+    }
+
+    file.set(std::move(out));
     return std::move(file);
 }
 } // namespace btu::tex
