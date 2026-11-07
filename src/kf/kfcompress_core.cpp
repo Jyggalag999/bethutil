@@ -26,9 +26,9 @@
 #include <set>
 #include <stdexcept>
 
-#include "bspline.hpp"
-#include "dedupe_types.hpp"
-#include "niftypes.hpp"
+#include "btu/kf/detail/bspline.hpp"
+#include "btu/kf/detail/dedupe_types.hpp"
+#include "btu/kf/detail/niftypes.hpp"
 
 using namespace nif;
 
