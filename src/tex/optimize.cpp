@@ -21,6 +21,9 @@ auto optimize(Texture &&file, OptimizationSteps sets, CompressionDevice &dev) no
     // Only change is DXT5 -> DXT1: copy the colour blocks, no decode/re-encode, no quality loss.
     if (sets.bc3_to_bc1 && !sets.convert && !sets.resize && !sets.add_transparent_alpha && !sets.mipmaps)
         return bc3_to_bc1(std::move(file));
+    // Only change is binary-alpha DXT5 -> DXT1 with 1-bit alpha: opaque blocks copied, others re-encoded.
+    if (sets.bc3_to_bc1a && !sets.convert && !sets.resize && !sets.add_transparent_alpha && !sets.mipmaps)
+        return bc3_to_bc1a(std::move(file));
 
     const auto &info = file.get().GetMetadata();
     // All operations require a decompressed texture.
@@ -280,6 +283,17 @@ auto compute_optimization_steps(const Texture &file, const Settings &sets) noexc
             && bc3_alpha_all_opaque(tex))
         {
             res.bc3_to_bc1  = true;
+            res.best_format = bc1;
+        }
+        // Opt-in: diffuse DXT5 whose alpha is exactly 0/255 everywhere -> DXT1 with 1-bit alpha. Only as
+        // the sole step, so anything else that wants to touch the texture keeps the normal DXT5 path.
+        else if (sets.bc3_to_bc1a && bc1 != DXGI_FORMAT_UNKNOWN && allowed
+                 && bc1 == sets.output_format.compressed_without_alpha
+                 && info.format != DXGI_FORMAT_BC3_TYPELESS && !info.IsCubemap() && !res.convert
+                 && !res.resize && !res.mipmaps && is_diffuse_path(file.get_load_path())
+                 && bc3_alpha_binary(tex))
+        {
+            res.bc3_to_bc1a = true;
             res.best_format = bc1;
         }
     }

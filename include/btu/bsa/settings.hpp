@@ -292,11 +292,14 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
                 s.version      = ArchiveVersion::tes5;
                 s.dummy_plugin = std::vector(std::begin(dummy::fnv), std::end(dummy::fnv));
 
-                // Raised from the tes4 default (2000 MiB): FNV BSAs can go right up to the
-                // format's ~4GiB ceiling, so cap comfortably under that instead of splitting
-                // twice as often as necessary. 3.95 GiB leaves margin below 4GiB for tools/
-                // readers that get flaky exactly at the 32-bit size-field boundary.
-                s.max_size = gigabyte * 395 / 100; // 3.95 GiB
+                // FNV loads .kf animations from BSAs, so unlike the TES4 base list they are
+                // packable here, into the meshes archive alongside the .nif files.
+                s.standard_files.push_back(AllowedPath{u8".kf", {u8"meshes"}, TES4ArchiveType::meshes});
+
+                // FNV default: 1.95 GiB per archive. CAO's "Max size to pack BSAs to" override
+                // lets the user go up to 3.95 GiB (margin below the format's ~4GiB ceiling, where
+                // tools/readers get flaky at the 32-bit size-field boundary).
+                s.max_size = gigabyte * 195 / 100; // 1.95 GiB
 
                 // Split textures/meshes/sounds into their own archives instead of
                 // one combined BSA: "ModName - Textures.bsa" / " - Meshes.bsa" / " - Sounds.bsa".

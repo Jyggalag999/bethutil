@@ -303,7 +303,125 @@ constexpr size_t k_bc1_block_bytes = 8;
     }
     return true;
 }
+
+/// One BC3 alpha block: every texel inside the `valid_w` x `valid_h` corner of the 4x4 block decodes to
+/// exactly 0 or 255. Texels outside the image (block padding) are ignored. `has_zero` is set when a
+/// checked texel is exactly 0.
+[[nodiscard]] auto alpha_block_binary(const uint8_t *block,
+                                      const size_t valid_w,
+                                      const size_t valid_h,
+                                      bool &has_zero) noexcept -> bool
+{
+    const uint8_t a0 = block[0];
+    const uint8_t a1 = block[1];
+
+    uint64_t bits = 0;
+    for (int i = 5; i >= 0; --i)
+        bits = (bits << 8) | block[2 + i];
+
+    for (size_t t = 0; t < 16; ++t)
+    {
+        if (t % 4 >= valid_w || t / 4 >= valid_h)
+            continue;
+        const auto idx = static_cast<unsigned>((bits >> (3 * t)) & 7U);
+        int value      = -1; // -1: not exactly 0 or 255
+        if (idx == 0)
+            value = a0;
+        else if (idx == 1)
+            value = a1;
+        else if (a0 <= a1 && idx == 6)
+            value = 0;
+        else if (a0 <= a1 && idx == 7)
+            value = 255;
+        else if (a0 == a1)
+            value = a0; // 6-alpha mode, equal ends: every interpolated entry equals the end
+        if (value != 0 && value != 255)
+            return false;
+        if (value == 0)
+            has_zero = true;
+    }
+    return true;
+}
+
+/// Colour half of a BC3 block (8 bytes at `c`) -> the equivalent BC1 block at `d`, bit-exact colours.
+/// A BC3 block is decoded in 4-colour mode always; BC1 uses 4-colour mode only when c0 > c1.
+void copy_colour_block(const uint8_t *c, uint8_t *d) noexcept
+{
+    const auto c0 = static_cast<uint16_t>(c[0] | (c[1] << 8));
+    const auto c1 = static_cast<uint16_t>(c[2] | (c[3] << 8));
+    uint32_t idx  = static_cast<uint32_t>(c[4]) | (static_cast<uint32_t>(c[5]) << 8)
+                   | (static_cast<uint32_t>(c[6]) << 16) | (static_cast<uint32_t>(c[7]) << 24);
+
+    uint16_t o0 = c0;
+    uint16_t o1 = c1;
+    if (c0 == c1)
+    {
+        idx = 0; // every 4-colour palette entry equals c0; index 0 avoids BC1's transparent slot
+    }
+    else if (c0 < c1)
+    {
+        // Swap endpoints: palette entries 0<->1 and 2<->3 trade places, so flip the low bit
+        // of every 2-bit index. (2*a+b)/3 with the ends swapped is the same colour.
+        o0 = c1;
+        o1 = c0;
+        idx ^= 0x55555555U;
+    }
+
+    d[0] = static_cast<uint8_t>(o0 & 0xFF);
+    d[1] = static_cast<uint8_t>(o0 >> 8);
+    d[2] = static_cast<uint8_t>(o1 & 0xFF);
+    d[3] = static_cast<uint8_t>(o1 >> 8);
+    d[4] = static_cast<uint8_t>(idx & 0xFF);
+    d[5] = static_cast<uint8_t>((idx >> 8) & 0xFF);
+    d[6] = static_cast<uint8_t>((idx >> 16) & 0xFF);
+    d[7] = static_cast<uint8_t>(idx >> 24);
+}
 } // namespace
+
+auto bc3_alpha_binary(const ScratchImage &tex) noexcept -> bool
+{
+    if (bc1_counterpart(tex.GetMetadata().format) == DXGI_FORMAT_UNKNOWN)
+        return false;
+
+    bool has_zero      = false;
+    const auto *images = tex.GetImages();
+    for (size_t i = 0; i < tex.GetImageCount(); ++i)
+    {
+        const auto &img = images[i];
+        const auto bw   = block_count(img.width);
+        const auto bh   = block_count(img.height);
+        if (img.pixels == nullptr || img.rowPitch < bw * k_bc3_block_bytes)
+            return false;
+        for (size_t by = 0; by < bh; ++by)
+        {
+            const auto *row     = img.pixels + by * img.rowPitch;
+            const auto valid_h  = std::min<size_t>(4, img.height - by * 4);
+            for (size_t bx = 0; bx < bw; ++bx)
+            {
+                const auto valid_w = std::min<size_t>(4, img.width - bx * 4);
+                if (!alpha_block_binary(row + bx * k_bc3_block_bytes, valid_w, valid_h, has_zero))
+                    return false;
+            }
+        }
+    }
+    return has_zero;
+}
+
+auto is_diffuse_path(const Path &path) -> bool
+{
+    auto stem = path.stem().u8string();
+    for (auto &ch : stem)
+        if (ch >= u8'A' && ch <= u8'Z')
+            ch = static_cast<char8_t>(ch - u8'A' + u8'a');
+
+    constexpr std::u8string_view suffixes[] = {u8"_n",  u8"_g",  u8"_m",   u8"_e",  u8"_p",   u8"_s", u8"_sk",
+                                               u8"_hh", u8"_hl", u8"_em",  u8"_msn", u8"_b",  u8"_bl"};
+    const std::u8string_view s              = stem;
+    for (const auto suffix : suffixes)
+        if (s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix)
+            return false;
+    return true;
+}
 
 auto bc3_alpha_all_opaque(const ScratchImage &tex) noexcept -> bool
 {
@@ -367,39 +485,85 @@ auto bc3_to_bc1(Texture &&file) -> Result
             auto *dst_row       = dst.pixels + by * dst.rowPitch;
             for (size_t bx = 0; bx < bw; ++bx)
             {
-                // A BC3 block is 8 bytes of alpha, then a colour block laid out like BC1's but always
-                // decoded in 4-colour mode. BC1 uses 4-colour mode only when c0 > c1.
-                const auto *c = src_row + bx * k_bc3_block_bytes + 8;
+                copy_colour_block(src_row + bx * k_bc3_block_bytes + 8, dst_row + bx * k_bc1_block_bytes);
+            }
+        }
+    }
+
+    file.set(std::move(out));
+    return std::move(file);
+}
+
+auto bc3_to_bc1a(Texture &&file) -> Result
+{
+    const auto &tex  = file.get();
+    const auto &info = tex.GetMetadata();
+    const auto out_format = bc1_counterpart(info.format);
+    if (out_format == DXGI_FORMAT_UNKNOWN || info.format == DXGI_FORMAT_BC3_TYPELESS)
+        return tl::make_unexpected(Error(TextureErr::BadInput));
+
+    // Decode, then let DirectXTex encode to BC1 (alpha threshold 0.5: exact 0/255 maps to the
+    // transparent / opaque slot with no ambiguity).
+    ScratchImage rgba;
+    if (const auto hr = Decompress(tex.GetImages(), tex.GetImageCount(), info, DXGI_FORMAT_UNKNOWN, rgba);
+        FAILED(hr))
+        return tl::make_unexpected(error_from_hresult(hr));
+
+    ScratchImage encoded;
+    if (const auto hr = Compress(rgba.GetImages(),
+                                 rgba.GetImageCount(),
+                                 rgba.GetMetadata(),
+                                 out_format,
+                                 DirectX::TEX_COMPRESS_DEFAULT,
+                                 0.5F,
+                                 encoded);
+        FAILED(hr))
+        return tl::make_unexpected(error_from_hresult(hr));
+    if (encoded.GetImageCount() != tex.GetImageCount())
+        return tl::make_unexpected(Error(TextureErr::Unknown));
+
+    // Same layout, but with an alpha mode that doesn't claim the texture is opaque.
+    auto out_info = encoded.GetMetadata();
+    if (info.GetAlphaMode() == DirectX::TEX_ALPHA_MODE_OPAQUE)
+        out_info.SetAlphaMode(DirectX::TEX_ALPHA_MODE_UNKNOWN);
+    else
+        out_info.SetAlphaMode(info.GetAlphaMode());
+
+    ScratchImage out;
+    if (const auto hr = out.Initialize(out_info); FAILED(hr))
+        return tl::make_unexpected(error_from_hresult(hr));
+    if (out.GetImageCount() != tex.GetImageCount())
+        return tl::make_unexpected(Error(TextureErr::Unknown));
+
+    const auto *src_images = tex.GetImages();
+    const auto *enc_images = encoded.GetImages();
+    const auto *dst_images = out.GetImages();
+    for (size_t i = 0; i < tex.GetImageCount(); ++i)
+    {
+        const auto &src = src_images[i];
+        const auto &enc = enc_images[i];
+        const auto &dst = dst_images[i];
+        const auto bw   = block_count(src.width);
+        const auto bh   = block_count(src.height);
+        if (src.pixels == nullptr || dst.pixels == nullptr || enc.pixels == nullptr || src.width != dst.width
+            || src.height != dst.height || enc.width != dst.width || enc.height != dst.height
+            || src.rowPitch < bw * k_bc3_block_bytes || dst.rowPitch < bw * k_bc1_block_bytes
+            || enc.rowPitch < bw * k_bc1_block_bytes)
+            return tl::make_unexpected(Error(TextureErr::Unknown));
+
+        for (size_t by = 0; by < bh; ++by)
+        {
+            const auto *src_row = src.pixels + by * src.rowPitch;
+            const auto *enc_row = enc.pixels + by * enc.rowPitch;
+            auto *dst_row       = dst.pixels + by * dst.rowPitch;
+            for (size_t bx = 0; bx < bw; ++bx)
+            {
+                const auto *s = src_row + bx * k_bc3_block_bytes;
                 auto *d       = dst_row + bx * k_bc1_block_bytes;
-
-                const auto c0 = static_cast<uint16_t>(c[0] | (c[1] << 8));
-                const auto c1 = static_cast<uint16_t>(c[2] | (c[3] << 8));
-                uint32_t idx  = static_cast<uint32_t>(c[4]) | (static_cast<uint32_t>(c[5]) << 8)
-                               | (static_cast<uint32_t>(c[6]) << 16) | (static_cast<uint32_t>(c[7]) << 24);
-
-                uint16_t o0 = c0;
-                uint16_t o1 = c1;
-                if (c0 == c1)
-                {
-                    idx = 0; // every 4-colour palette entry equals c0; index 0 avoids BC1's transparent slot
-                }
-                else if (c0 < c1)
-                {
-                    // Swap endpoints: palette entries 0<->1 and 2<->3 trade places, so flip the low bit
-                    // of every 2-bit index. (2*a+b)/3 with the ends swapped is the same colour.
-                    o0 = c1;
-                    o1 = c0;
-                    idx ^= 0x55555555U;
-                }
-
-                d[0] = static_cast<uint8_t>(o0 & 0xFF);
-                d[1] = static_cast<uint8_t>(o0 >> 8);
-                d[2] = static_cast<uint8_t>(o1 & 0xFF);
-                d[3] = static_cast<uint8_t>(o1 >> 8);
-                d[4] = static_cast<uint8_t>(idx & 0xFF);
-                d[5] = static_cast<uint8_t>((idx >> 8) & 0xFF);
-                d[6] = static_cast<uint8_t>((idx >> 16) & 0xFF);
-                d[7] = static_cast<uint8_t>(idx >> 24);
+                if (alpha_block_opaque(s))
+                    copy_colour_block(s + 8, d); // fully opaque block: lossless
+                else
+                    std::memcpy(d, enc_row + bx * k_bc1_block_bytes, k_bc1_block_bytes);
             }
         }
     }

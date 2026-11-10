@@ -23,9 +23,9 @@ struct Settings
 {
     [[nodiscard]] static auto get(Game game) noexcept -> const Settings &;
 
-    Game game;
+    Game game = Game::SSE;
 
-    bool compress;
+    bool compress = false;
     bool force_crunch = false; // Use crnlib's DXT encoder (via CrunchTexture path) instead of DirectXTex
 
     // When true, restricts `compress` to textures that aren't already block-compressed: an
@@ -34,10 +34,14 @@ struct Settings
     // /compressed_without_alpha. See best_output_format() in optimize.cpp.
     bool compress_uncompressed_only = false;
 
-    std::variant<std::monostate, util::ResizeRatio, Dimension> resize;
-    bool mipmaps;
+    // Opt-in: store diffuse DXT5 whose alpha is exactly 0/255 everywhere as DXT1 with 1-bit alpha.
+    // Only when it would be the sole step; see compute_optimization_steps().
+    bool bc3_to_bc1a = false;
 
-    bool use_format_whitelist;
+    std::variant<std::monostate, util::ResizeRatio, Dimension> resize;
+    bool mipmaps = false;
+
+    bool use_format_whitelist = false;
     std::vector<DXGI_FORMAT> allowed_formats;
 
     BestFormatFor output_format;
@@ -45,11 +49,12 @@ struct Settings
     std::vector<std::u8string> landscape_textures;
 };
 
-NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(Settings,
+NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE_WITH_DEFAULT(Settings,
                                    game,
                                    compress,
                                    force_crunch,
                                    compress_uncompressed_only,
+                                   bc3_to_bc1a,
                                    resize,
                                    mipmaps,
                                    use_format_whitelist,
@@ -67,6 +72,8 @@ struct OptimizationSteps
     // DXT5/BC3 whose alpha is fully opaque, re-stored as DXT1/BC1 (half the size). When it is the
     // only step, optimize() copies the colour blocks instead of re-encoding, so it is lossless.
     bool bc3_to_bc1 = false;
+    // DXT5/BC3 diffuse whose alpha is exactly 0/255 everywhere, re-stored as DXT1 with 1-bit alpha.
+    bool bc3_to_bc1a = false;
 
     auto operator<=>(const OptimizationSteps &) const noexcept = default;
 };

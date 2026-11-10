@@ -38,5 +38,15 @@ namespace btu::tex {
 /// BC1 would otherwise read the block in its 3-colour mode. Bit-exact colours, alpha dropped, so
 /// only call it when bc3_alpha_all_opaque() is true.
 [[nodiscard]] auto bc3_to_bc1(Texture &&file) -> Result;
+/// True when `tex` is BC3, every texel of every image decodes to exactly 0 or 255, and at least one
+/// texel is 0 (all-255 is bc3_alpha_all_opaque's case). Conservative, reads the alpha blocks directly.
+[[nodiscard]] auto bc3_alpha_binary(const ScratchImage &tex) noexcept -> bool;
+/// False for normal / glow / specular / etc. maps (file stem suffix list) whose alpha is data, not
+/// transparency. Case-insensitive.
+[[nodiscard]] auto is_diffuse_path(const Path &path) -> bool;
+/// BC3 -> BC1 with 1-bit alpha for a texture where bc3_alpha_binary() is true. Blocks whose alpha is
+/// entirely 255 are copied losslessly; blocks with transparent texels are re-encoded by DirectXTex
+/// (RGB of transparent texels becomes black). Alpha is preserved exactly.
+[[nodiscard]] auto bc3_to_bc1a(Texture &&file) -> Result;
 [[nodiscard]] auto resize(Texture &&file, Dimension dim) -> Result;
 } // namespace btu::tex
